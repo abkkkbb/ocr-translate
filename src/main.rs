@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod free_translate;
+mod screen_clip;
 mod volcengine;
 mod windows_ocr;
 
@@ -100,7 +101,11 @@ struct OcrTranslateApp {
     config_path: PathBuf,
     result: TranslationResult,
     selected_file: Option<PathBuf>,
+    temporary_capture: Option<PathBuf>,
     request_rx: Option<Receiver<RequestResult>>,
+    capture_rx: Option<Receiver<Result<PathBuf, String>>>,
+    hotkey_rx: Receiver<screen_clip::HotkeyEvent>,
+    hotkey_capture_active: bool,
     status: String,
     settings_open: bool,
     show_api_key: bool,
@@ -109,7 +114,7 @@ struct OcrTranslateApp {
 }
 
 impl OcrTranslateApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         let config_path = config_path();
         let mut config = load_config(&config_path);
         let ocr_languages = windows_ocr::available_languages();
@@ -123,8 +128,12 @@ impl OcrTranslateApp {
             config_path,
             result: TranslationResult::default(),
             selected_file: None,
+            temporary_capture: None,
             request_rx: None,
-            status: "准备就绪。选择一张截图开始翻译。".into(),
+            capture_rx: None,
+            hotkey_rx: screen_clip::listen_for_hotkey(ctx.clone()),
+            hotkey_capture_active: false,
+            status: "准备就绪。按 Ctrl+Shift+T 框选屏幕。".into(),
             settings_open: true,
             show_api_key: false,
             show_volcengine_keys: false,
@@ -152,9 +161,84 @@ impl OcrTranslateApp {
             .add_filter("图片", &["png", "jpg", "jpeg", "webp", "bmp"])
             .pick_file();
         if let Some(path) = picked {
+            if let Some(previous) = self.temporary_capture.take() {
+                let _ = fs::remove_file(previous);
+            }
             self.selected_file = Some(path.clone());
             self.start_translation(path, ctx);
         }
+    }
+
+    fn start_screen_capture(&mut self, ctx: &egui::Context) {
+        if self.capture_rx.is_some() || self.hotkey_capture_active || self.request_rx.is_some() {
+            return;
+        }
+        self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
+        let (tx, rx) = mpsc::channel();
+        self.capture_rx = Some(rx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(250));
+            let _ = tx.send(screen_clip::capture_region());
+        });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    fn poll_screen_capture(&mut self, ctx: &egui::Context) {
+        let received = self.capture_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(Ok(path))) => {
+                self.capture_rx = None;
+                self.accept_capture(path, ctx);
+            }
+            Some(Ok(Err(error))) => {
+                self.capture_rx = None;
+                self.status = error;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.capture_rx = None;
+                self.status = "截图任务意外结束。".into();
+            }
+            _ => {
+                if self.capture_rx.is_some() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    fn poll_hotkey(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.hotkey_rx.try_recv() {
+            match event {
+                screen_clip::HotkeyEvent::Ready => {}
+                screen_clip::HotkeyEvent::Started => {
+                    self.hotkey_capture_active = true;
+                    self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
+                }
+                screen_clip::HotkeyEvent::Captured(Ok(path)) => {
+                    self.hotkey_capture_active = false;
+                    self.accept_capture(path, ctx);
+                }
+                screen_clip::HotkeyEvent::Captured(Err(error)) => {
+                    self.hotkey_capture_active = false;
+                    self.status = error;
+                }
+                screen_clip::HotkeyEvent::Failed(error) => self.status = error,
+            }
+        }
+    }
+
+    fn accept_capture(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if let Some(previous) = self.temporary_capture.replace(path.clone()) {
+            let _ = fs::remove_file(previous);
+        }
+        self.selected_file = Some(path.clone());
+        self.settings_open = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.start_translation(path, ctx);
     }
 
     fn start_translation(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -423,11 +507,7 @@ impl OcrTranslateApp {
         }
         ui.add_space(8.0);
 
-        ui.label("截图快捷键（即将接入全局监听）");
-        ui.add_enabled(
-            false,
-            egui::TextEdit::singleline(&mut self.config.shortcut).desired_width(f32::INFINITY),
-        );
+        ui.label("全局截图快捷键：Ctrl+Shift+T（应用运行期间有效）");
         ui.add_space(14.0);
 
         if ui.button("保存设置").clicked() {
@@ -440,13 +520,26 @@ impl OcrTranslateApp {
     fn draw_result(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("截图翻译");
         ui.add_space(4.0);
-        ui.label("选择图片识别，或直接输入原文后翻译。");
+        ui.label("按 Ctrl+Shift+T 框选屏幕，选择图片，或直接输入原文翻译。");
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    self.request_rx.is_none(),
+                    self.request_rx.is_none()
+                        && self.capture_rx.is_none()
+                        && !self.hotkey_capture_active,
+                    egui::Button::new("框选屏幕"),
+                )
+                .clicked()
+            {
+                self.start_screen_capture(ctx);
+            }
+            if ui
+                .add_enabled(
+                    self.request_rx.is_none()
+                        && self.capture_rx.is_none()
+                        && !self.hotkey_capture_active,
                     egui::Button::new("选择截图 / 图片"),
                 )
                 .clicked()
@@ -454,13 +547,23 @@ impl OcrTranslateApp {
                 self.choose_image(ctx);
             }
             if ui
-                .add_enabled(self.request_rx.is_none(), egui::Button::new("翻译原文"))
+                .add_enabled(
+                    self.request_rx.is_none()
+                        && self.capture_rx.is_none()
+                        && !self.hotkey_capture_active,
+                    egui::Button::new("翻译原文"),
+                )
                 .clicked()
             {
                 self.start_text_translation(ctx);
             }
             if ui
-                .add_enabled(self.request_rx.is_none(), egui::Button::new("重新翻译"))
+                .add_enabled(
+                    self.request_rx.is_none()
+                        && self.capture_rx.is_none()
+                        && !self.hotkey_capture_active,
+                    egui::Button::new("重新翻译"),
+                )
                 .clicked()
             {
                 if let Some(path) = self.selected_file.clone() {
@@ -468,11 +571,15 @@ impl OcrTranslateApp {
                 }
             }
             if let Some(path) = &self.selected_file {
-                ui.label(
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("已选择图片"),
-                );
+                if self.temporary_capture.as_ref() == Some(path) {
+                    ui.label("刚才框选的屏幕");
+                } else {
+                    ui.label(
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("已选择图片"),
+                    );
+                }
             }
         });
         ui.add_space(16.0);
@@ -499,6 +606,8 @@ impl OcrTranslateApp {
 
 impl eframe::App for OcrTranslateApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_hotkey(ctx);
+        self.poll_screen_capture(ctx);
         self.poll_request(ctx);
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -523,6 +632,14 @@ impl eframe::App for OcrTranslateApp {
                 self.draw_result(ui, ctx);
             }
         });
+    }
+}
+
+impl Drop for OcrTranslateApp {
+    fn drop(&mut self) {
+        if let Some(path) = self.temporary_capture.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -762,7 +879,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             install_chinese_font(&cc.egui_ctx);
-            Ok(Box::new(OcrTranslateApp::new()))
+            Ok(Box::new(OcrTranslateApp::new(&cc.egui_ctx)))
         }),
     )
 }

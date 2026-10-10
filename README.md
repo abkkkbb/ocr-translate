@@ -13,9 +13,10 @@ A small Windows desktop prototype for recognizing text in an image and showing t
 - Select a PNG, JPEG, WebP, or BMP image. Free and Volcengine modes send recognized text to their translation provider; vision mode sends the image to the configured model.
 - Show source text and translation in separate editable panes.
 - Translate text entered or pasted directly into the source pane with the `翻译原文` button; an image is only required for the OCR workflow.
+- Press `Ctrl+Shift+T` while the app is running, or click `框选屏幕`, to select a region with Windows' screen snip UI. The screenshot is copied from the clipboard to a temporary PNG and automatically passed through the existing OCR/translation workflow.
 - Reject images larger than 20 MB and stop requests after two minutes.
 
-This version does not yet include global hotkeys, screen-region capture, or a system tray.
+The global shortcut is fixed at `Ctrl+Shift+T` for now. Windows' `Win+Shift+S` screen snip shortcut and automatic clipboard copy must be available. Closing the app unregisters the shortcut when the process exits; this version does not yet have a system tray.
 
 The no-key providers use website translation endpoints and may be rate limited or change without notice. Google returned HTTP 429 during development; Tencent worked. Only recognized text is sent to those endpoints, while Windows OCR runs locally. If Windows OCR has no language pack for the source text, install one in Windows language settings.
 
@@ -39,8 +40,7 @@ cargo test
 
 ## Planned implementation order
 
-1. Add global shortcut registration and a screen-region selector.
-2. Add multi-monitor capture and pass the selected crop to the existing request path.
-3. Add tray behavior, hide-to-tray, and reopen-main-window actions.
-4. Consider Volcengine's `TranslateImage` endpoint as an optional direct image route.
-5. Measure release memory use and reduce startup/runtime costs based on actual measurements.
+1. Validate the new screen-selection flow on multi-monitor and mixed-DPI setups, including cancellation.
+2. Add tray behavior, hide-to-tray, and reopen-main-window actions.
+3. Consider Volcengine's `TranslateImage` endpoint as an optional direct image route.
+4. Measure release memory use and reduce startup/runtime costs based on actual measurements.
