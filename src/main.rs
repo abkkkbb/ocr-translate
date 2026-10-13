@@ -120,6 +120,7 @@ struct OcrTranslateApp {
     capture_rx: Option<Receiver<Result<PathBuf, String>>>,
     hotkey_rx: Receiver<screen_clip::HotkeyEvent>,
     hotkey_capture_active: bool,
+    paste_key_down: bool,
     status: String,
     settings_open: bool,
     show_api_key: bool,
@@ -151,6 +152,7 @@ impl OcrTranslateApp {
             capture_rx: None,
             hotkey_rx: screen_clip::listen_for_hotkey(ctx.clone()),
             hotkey_capture_active: false,
+            paste_key_down: false,
             status: "准备就绪。按 Ctrl+Shift+T 框选屏幕。".into(),
             settings_open: true,
             show_api_key: false,
@@ -257,6 +259,17 @@ impl OcrTranslateApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.start_translation(path, ctx);
+    }
+
+    fn paste_image(&mut self, ctx: &egui::Context) {
+        if self.request_rx.is_some() || self.capture_rx.is_some() || self.hotkey_capture_active {
+            return;
+        }
+        match screen_clip::paste_clipboard_image() {
+            Ok(Some(path)) => self.accept_capture(path, ctx),
+            Ok(None) => {}
+            Err(error) => self.status = error,
+        }
     }
 
     fn start_translation(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -610,7 +623,7 @@ impl OcrTranslateApp {
             }
             if let Some(path) = &self.selected_file {
                 if self.temporary_capture.as_ref() == Some(path) {
-                    ui.label("刚才框选的屏幕");
+                    ui.label("当前图片");
                 } else {
                     ui.label(
                         path.file_name()
@@ -623,14 +636,31 @@ impl OcrTranslateApp {
         ui.add_space(16.0);
 
         let available = ui.available_height();
+        let paste_released = ui.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: false,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl
+                )
+            })
+        });
+        let paste_keys_down = screen_clip::paste_keys_down();
+        let mut source_focused = false;
         ui.columns(2, |columns| {
             columns[0].label("原文");
-            columns[0].add_sized(
-                [columns[0].available_width(), (available - 48.0).max(160.0)],
-                egui::TextEdit::multiline(&mut self.result.source_text)
-                    .hint_text("输入或识别出的原文会显示在这里")
-                    .desired_rows(12),
-            );
+            source_focused = columns[0]
+                .add_sized(
+                    [columns[0].available_width(), (available - 48.0).max(160.0)],
+                    egui::TextEdit::multiline(&mut self.result.source_text)
+                        .hint_text("输入或识别出的原文会显示在这里")
+                        .desired_rows(12),
+                )
+                .has_focus();
             columns[1].label("译文");
             columns[1].add_sized(
                 [columns[1].available_width(), (available - 48.0).max(160.0)],
@@ -639,6 +669,10 @@ impl OcrTranslateApp {
                     .desired_rows(12),
             );
         });
+        if source_focused && ((paste_keys_down || paste_released) && !self.paste_key_down) {
+            self.paste_image(ctx);
+        }
+        self.paste_key_down = paste_keys_down;
     }
 }
 

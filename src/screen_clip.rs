@@ -15,6 +15,7 @@ use windows::{
                 GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
                 INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_CONTROL,
                 MOD_NOREPEAT, MOD_SHIFT, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_S, VK_SHIFT, VK_T,
+                VK_V,
             },
             WindowsAndMessaging::{
                 FindWindowW, GetMessageW, SetForegroundWindow, ShowWindowAsync, MSG, SW_RESTORE,
@@ -72,6 +73,24 @@ pub fn capture_region() -> Result<PathBuf, String> {
     result
 }
 
+pub fn paste_keys_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 && GetAsyncKeyState(VK_V.0 as i32) < 0 }
+}
+
+pub fn paste_clipboard_image() -> Result<Option<PathBuf>, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("无法读取剪贴板：{error}"))?;
+    for _ in 0..3 {
+        match clipboard.get_image() {
+            Ok(data) => return save_image(data).map(Some),
+            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+            Err(arboard::Error::ClipboardOccupied) => thread::sleep(Duration::from_millis(30)),
+            Err(error) => return Err(format!("读取剪贴板图片失败：{error}")),
+        }
+    }
+    Err("剪贴板正被占用，请重试粘贴。".into())
+}
+
 fn restore_main_window() {
     if let Ok(window) = unsafe { FindWindowW(None, w!("OCR Translate")) } {
         unsafe {
@@ -110,22 +129,7 @@ fn capture_region_inner() -> Result<PathBuf, String> {
             for _ in 0..10 {
                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
                     if let Ok(data) = clipboard.get_image() {
-                        let image = image::RgbaImage::from_raw(
-                            data.width as u32,
-                            data.height as u32,
-                            data.bytes.into_owned(),
-                        )
-                        .ok_or("截图像素数据无效。")?;
-                        let stamp = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map_err(|error| error.to_string())?
-                            .as_nanos();
-                        let path = std::env::temp_dir()
-                            .join(format!("ocr-translate-{}-{stamp}.png", std::process::id()));
-                        image
-                            .save(&path)
-                            .map_err(|error| format!("保存临时截图失败：{error}"))?;
-                        return Ok(path);
+                        return save_image(data);
                     }
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -134,6 +138,25 @@ fn capture_region_inner() -> Result<PathBuf, String> {
         thread::sleep(Duration::from_millis(100));
     }
     Err("等待框选截图超时。若已取消，请重试快捷键。".into())
+}
+
+fn save_image(data: arboard::ImageData<'_>) -> Result<PathBuf, String> {
+    let image = image::RgbaImage::from_raw(
+        data.width as u32,
+        data.height as u32,
+        data.bytes.into_owned(),
+    )
+    .ok_or("剪贴板图片像素数据无效。")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("ocr-translate-{}-{stamp}.png", std::process::id()));
+    image
+        .save(&path)
+        .map_err(|error| format!("保存临时图片失败：{error}"))?;
+    Ok(path)
 }
 
 fn key_event(key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY, key_up: bool) -> INPUT {

@@ -14,6 +14,7 @@ A small Windows desktop prototype for recognizing text in an image and showing t
 - Select a PNG, JPEG, WebP, or BMP image. Free and Volcengine modes send recognized text to their translation provider; vision mode sends the image to the configured model.
 - Show source text and translation in separate editable panes.
 - Translate text entered or pasted directly into the source pane with the `翻译原文` button; an image is only required for the OCR workflow.
+- Paste an image into the focused source pane with `Ctrl+V` to run the same OCR and translation workflow as selecting an image. Pasting text still inserts text normally.
 - Press `Ctrl+Shift+T` while the app is running, or click `框选屏幕`, to select a region with Windows' screen snip UI. The screenshot is copied from the clipboard to a temporary PNG and automatically passed through the existing OCR/translation workflow.
 - Reject images larger than 20 MB and stop requests after two minutes.
 
