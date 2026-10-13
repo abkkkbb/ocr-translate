@@ -10,6 +10,7 @@ A small Windows desktop prototype for recognizing text in an image and showing t
 - Configure an OpenAI-compatible vision model as an alternative image translation provider.
 - Configure API URL, API key, model, and target language for the vision model.
 - Save settings under the current user's application config directory.
+- Switch between day and night themes and adjust the app font size in settings; changes preview immediately and persist when settings are saved.
 - Select a PNG, JPEG, WebP, or BMP image. Free and Volcengine modes send recognized text to their translation provider; vision mode sends the image to the configured model.
 - Show source text and translation in separate editable panes.
 - Translate text entered or pasted directly into the source pane with the `翻译原文` button; an image is only required for the OCR workflow.

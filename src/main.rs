@@ -21,6 +21,8 @@ use std::{
 
 const CONFIG_FILE: &str = "config.json";
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_FONT_SIZE: u8 = 13;
+const FONT_SIZE_RANGE: std::ops::RangeInclusive<u8> = 12..=22;
 const TARGET_LANGUAGES: [&str; 9] = [
     "简体中文",
     "繁体中文",
@@ -54,10 +56,20 @@ impl TranslationMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ThemeMode {
+    Day,
+    #[default]
+    Night,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct AppConfig {
     mode: TranslationMode,
+    theme: ThemeMode,
+    font_size: u8,
     ocr_language: String,
     api_url: String,
     api_key: String,
@@ -72,6 +84,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             mode: TranslationMode::Tencent,
+            theme: ThemeMode::Night,
+            font_size: DEFAULT_FONT_SIZE,
             ocr_language: "en-US".into(),
             api_url: "https://api.openai.com/v1/chat/completions".into(),
             api_key: String::new(),
@@ -117,6 +131,10 @@ impl OcrTranslateApp {
     fn new(ctx: &egui::Context) -> Self {
         let config_path = config_path();
         let mut config = load_config(&config_path);
+        config.font_size = config
+            .font_size
+            .clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
+        apply_appearance(ctx, &config);
         let ocr_languages = windows_ocr::available_languages();
         if config.ocr_language != "auto"
             && !ocr_languages.iter().any(|tag| tag == &config.ocr_language)
@@ -385,6 +403,26 @@ impl OcrTranslateApp {
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("翻译设置");
         ui.add_space(8.0);
+        ui.label("主题");
+        let previous_theme = self.config.theme;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.config.theme, ThemeMode::Day, "日间");
+            ui.selectable_value(&mut self.config.theme, ThemeMode::Night, "夜间");
+        });
+        if self.config.theme != previous_theme {
+            apply_appearance(ui.ctx(), &self.config);
+        }
+        ui.add_space(8.0);
+
+        ui.label("字号大小");
+        if ui
+            .add(egui::Slider::new(&mut self.config.font_size, FONT_SIZE_RANGE).suffix(" px"))
+            .changed()
+        {
+            apply_appearance(ui.ctx(), &self.config);
+        }
+        ui.add_space(16.0);
+
         ui.label("翻译渠道");
         egui::ComboBox::from_id_salt("translation_mode")
             .selected_text(self.config.mode.label())
@@ -523,7 +561,7 @@ impl OcrTranslateApp {
         ui.label("按 Ctrl+Shift+T 框选屏幕，选择图片，或直接输入原文翻译。");
         ui.add_space(12.0);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     self.request_rx.is_none()
@@ -612,8 +650,6 @@ impl eframe::App for OcrTranslateApp {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("OCR Translate");
-                ui.separator();
-                ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.selectable_label(self.settings_open, "设置").clicked() {
                         self.settings_open = true;
@@ -623,11 +659,12 @@ impl eframe::App for OcrTranslateApp {
                     }
                 });
             });
+            ui.label(&self.status);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.settings_open {
-                self.draw_settings(ui);
+                egui::ScrollArea::vertical().show(ui, |ui| self.draw_settings(ui));
             } else {
                 self.draw_result(ui, ctx);
             }
@@ -806,6 +843,31 @@ fn compact_error(text: &str) -> String {
     text.replace(['\r', '\n'], " ").chars().take(300).collect()
 }
 
+fn apply_appearance(ctx: &egui::Context, config: &AppConfig) {
+    ctx.set_visuals(match config.theme {
+        ThemeMode::Day => egui::Visuals::light(),
+        ThemeMode::Night => egui::Visuals::dark(),
+    });
+
+    let size = config
+        .font_size
+        .clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end()) as f32;
+    let mut style = (*ctx.style()).clone();
+    for (text_style, font_size) in [
+        (egui::TextStyle::Body, size),
+        (egui::TextStyle::Button, size),
+        (egui::TextStyle::Monospace, size),
+        (egui::TextStyle::Heading, size + 5.0),
+        (egui::TextStyle::Small, (size - 4.0).max(9.0)),
+    ] {
+        if let Some(font) = style.text_styles.get_mut(&text_style) {
+            font.size = font_size;
+        }
+    }
+    ctx.set_style(style);
+    ctx.request_repaint();
+}
+
 fn install_chinese_font(ctx: &egui::Context) {
     let font_dir = std::env::var_os("WINDIR")
         .map(PathBuf::from)
@@ -864,6 +926,19 @@ mod tests {
         .unwrap();
         assert!(config.volcengine_access_key.is_empty());
         assert!(config.volcengine_secret_key.is_empty());
+        assert_eq!(config.theme, ThemeMode::Night);
+        assert_eq!(config.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn appearance_settings_round_trip() {
+        let mut config = AppConfig::default();
+        config.theme = ThemeMode::Day;
+        config.font_size = 18;
+        let restored: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.theme, ThemeMode::Day);
+        assert_eq!(restored.font_size, 18);
     }
 }
 
