@@ -7,9 +7,16 @@ use std::{
 
 use eframe::egui;
 use windows::{
-    core::w,
+    core::{w, PWSTR},
     Win32::{
-        System::DataExchange::GetClipboardSequenceNumber,
+        Foundation::CloseHandle,
+        System::{
+            DataExchange::GetClipboardSequenceNumber,
+            Threading::{
+                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
         UI::{
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
@@ -18,8 +25,8 @@ use windows::{
                 VK_V,
             },
             WindowsAndMessaging::{
-                FindWindowW, GetMessageW, SetForegroundWindow, ShowWindowAsync, MSG, SW_RESTORE,
-                WM_HOTKEY,
+                FindWindowW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+                SetForegroundWindow, ShowWindowAsync, MSG, SW_RESTORE, WM_HOTKEY,
             },
         },
     },
@@ -80,6 +87,14 @@ pub fn paste_keys_down() -> bool {
 pub fn paste_clipboard_image() -> Result<Option<PathBuf>, String> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|error| format!("无法读取剪贴板：{error}"))?;
+    // WPS and Office put both text and a rendered picture on the clipboard when copying text.
+    // Prefer the text so the source pane's normal paste is not overwritten by OCR.
+    if clipboard
+        .get_text()
+        .is_ok_and(|text| !text.trim().is_empty())
+    {
+        return Ok(None);
+    }
     for _ in 0..3 {
         match clipboard.get_image() {
             Ok(data) => return save_image(data).map(Some),
@@ -117,11 +132,29 @@ fn capture_region_inner() -> Result<PathBuf, String> {
 
     let started = Instant::now();
     let mut sequence = previous_sequence;
+    // Only a fresh Escape press counts; one already held before the snip started is ignored.
+    let mut escape_was_down = escape_down();
+    let mut overlay_seen = false;
+    let mut overlay_left_at: Option<Instant> = None;
     while started.elapsed() < Duration::from_secs(60) {
-        // Escape closes the Windows selector without modifying the clipboard.
-        if unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } & 1 != 0 {
+        let escape_is_down = escape_down();
+        if escape_is_down && !escape_was_down {
             return Err("已取消框选截图。".into());
         }
+        escape_was_down = escape_is_down;
+
+        // The selector is a foreground Snipping Tool window. Once it has been seen and then
+        // loses the foreground without a new clipboard image, the user cancelled it.
+        if foreground_is_snipping_tool() {
+            overlay_seen = true;
+            overlay_left_at = None;
+        } else if overlay_seen {
+            let left_at = *overlay_left_at.get_or_insert_with(Instant::now);
+            if left_at.elapsed() > Duration::from_millis(1500) {
+                return Err("已取消框选截图。".into());
+            }
+        }
+
         let current = unsafe { GetClipboardSequenceNumber() };
         if current != sequence {
             sequence = current;
@@ -138,6 +171,42 @@ fn capture_region_inner() -> Result<PathBuf, String> {
         thread::sleep(Duration::from_millis(100));
     }
     Err("等待框选截图超时。若已取消，请重试快捷键。".into())
+}
+
+fn escape_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 }
+}
+
+fn foreground_is_snipping_tool() -> bool {
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process_id)) };
+    if process_id == 0 {
+        return false;
+    }
+    let Ok(process) =
+        (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) })
+    else {
+        return false;
+    };
+    let mut buffer = [0u16; 260];
+    let mut length = buffer.len() as u32;
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    if queried.is_err() {
+        return false;
+    }
+    let path = String::from_utf16_lossy(&buffer[..length as usize]).to_ascii_lowercase();
+    // Windows 11 uses SnippingTool.exe; older builds use ScreenClippingHost.exe.
+    ["\\snippingtool.exe", "\\screenclippinghost.exe"]
+        .iter()
+        .any(|name| path.ends_with(name))
 }
 
 fn save_image(data: arboard::ImageData<'_>) -> Result<PathBuf, String> {
