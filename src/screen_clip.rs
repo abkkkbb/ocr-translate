@@ -1,6 +1,11 @@
 use std::{
+    fmt, fs,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -9,73 +14,273 @@ use eframe::egui;
 use windows::{
     core::{w, PWSTR},
     Win32::{
-        Foundation::CloseHandle,
+        Foundation::{CloseHandle, LPARAM, WPARAM},
         System::{
             DataExchange::GetClipboardSequenceNumber,
             Threading::{
-                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
                 PROCESS_QUERY_LIMITED_INFORMATION,
             },
         },
         UI::{
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
-                INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_CONTROL,
-                MOD_NOREPEAT, MOD_SHIFT, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_S, VK_SHIFT, VK_T,
-                VK_V,
+                GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, HOT_KEY_MODIFIERS,
+                INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+                MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
+                VK_F1, VK_F12, VK_LWIN, VK_MENU, VK_S, VK_SHIFT, VK_T, VK_V,
             },
             WindowsAndMessaging::{
                 FindWindowW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-                SetForegroundWindow, ShowWindowAsync, MSG, SW_RESTORE, WM_HOTKEY,
+                PeekMessageW, PostThreadMessageW, SetForegroundWindow, ShowWindowAsync, MSG,
+                PM_NOREMOVE, SW_RESTORE, WM_APP, WM_HOTKEY,
             },
         },
     },
 };
 
 const HOTKEY_ID: i32 = 1;
+const WM_SET_HOTKEY: u32 = WM_APP + 1;
+const STALE_CAPTURE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hotkey {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub key: u16,
+}
+
+impl Default for Hotkey {
+    fn default() -> Self {
+        Self {
+            ctrl: true,
+            alt: false,
+            shift: true,
+            key: VK_T.0,
+        }
+    }
+}
+
+impl Hotkey {
+    /// Letters, digits and F1-F12. Virtual-key codes for letters and digits match ASCII.
+    pub fn key_choices() -> impl Iterator<Item = u16> {
+        (b'A'..=b'Z')
+            .chain(b'0'..=b'9')
+            .map(u16::from)
+            .chain(VK_F1.0..=VK_F12.0)
+    }
+
+    pub fn key_name(key: u16) -> String {
+        if (VK_F1.0..=VK_F12.0).contains(&key) {
+            format!("F{}", key - VK_F1.0 + 1)
+        } else {
+            char::from_u32(key.into())
+                .map(String::from)
+                .unwrap_or_default()
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut hotkey = Self {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            key: 0,
+        };
+        for part in text.split('+').map(str::trim) {
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => hotkey.ctrl = true,
+                "alt" => hotkey.alt = true,
+                "shift" => hotkey.shift = true,
+                _ if hotkey.key != 0 => return None,
+                _ => {
+                    hotkey.key = Self::key_choices()
+                        .find(|key| Self::key_name(*key).eq_ignore_ascii_case(part))?
+                }
+            }
+        }
+        hotkey.validate().ok().map(|_| hotkey)
+    }
+
+    /// Ctrl or Alt is required so the shortcut never swallows ordinary typing.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.key == 0 {
+            Err("请选择快捷键按键。".into())
+        } else if !self.ctrl && !self.alt {
+            Err("快捷键需要包含 Ctrl 或 Alt。".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn modifiers(&self) -> HOT_KEY_MODIFIERS {
+        [
+            (self.ctrl, MOD_CONTROL),
+            (self.alt, MOD_ALT),
+            (self.shift, MOD_SHIFT),
+        ]
+        .into_iter()
+        .filter(|(held, _)| *held)
+        .fold(MOD_NOREPEAT, |all, (_, modifier)| all | modifier)
+    }
+
+    fn to_message(self) -> (WPARAM, LPARAM) {
+        let flags = self.ctrl as isize | (self.alt as isize) << 1 | (self.shift as isize) << 2;
+        (WPARAM(self.key.into()), LPARAM(flags))
+    }
+
+    fn from_message(wparam: WPARAM, lparam: LPARAM) -> Self {
+        Self {
+            ctrl: lparam.0 & 1 != 0,
+            alt: lparam.0 & 2 != 0,
+            shift: lparam.0 & 4 != 0,
+            key: wparam.0 as u16,
+        }
+    }
+}
+
+impl fmt::Display for Hotkey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (held, name) in [
+            (self.ctrl, "Ctrl+"),
+            (self.alt, "Alt+"),
+            (self.shift, "Shift+"),
+        ] {
+            if held {
+                formatter.write_str(name)?;
+            }
+        }
+        formatter.write_str(&Self::key_name(self.key))
+    }
+}
 
 pub enum HotkeyEvent {
-    Ready,
+    Ready(Hotkey),
+    Busy,
     Started,
     Captured(Result<PathBuf, String>),
-    Failed(String),
+    /// Registration failed; `active` is the shortcut still in effect, if any.
+    Failed {
+        message: String,
+        active: Option<Hotkey>,
+    },
+}
+
+pub struct HotkeyListener {
+    pub events: Receiver<HotkeyEvent>,
+    busy: Arc<AtomicBool>,
+    thread_id: u32,
+}
+
+impl HotkeyListener {
+    /// Presses arriving while the app is busy are reported as `Busy` instead of starting a capture.
+    pub fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Release);
+    }
+
+    pub fn change(&self, hotkey: Hotkey) -> Result<(), String> {
+        let (wparam, lparam) = hotkey.to_message();
+        unsafe { PostThreadMessageW(self.thread_id, WM_SET_HOTKEY, wparam, lparam) }
+            .map_err(|error| format!("无法更新全局快捷键：{error}"))
+    }
+}
+
+fn register(hotkey: Hotkey) -> windows::core::Result<()> {
+    unsafe { RegisterHotKey(None, HOTKEY_ID, hotkey.modifiers(), hotkey.key.into()) }
 }
 
 /// RegisterHotKey delivers WM_HOTKEY to the registering thread's message queue.
-pub fn listen_for_hotkey(ctx: egui::Context) -> Receiver<HotkeyEvent> {
+pub fn listen_for_hotkey(ctx: egui::Context, hotkey: Hotkey) -> HotkeyListener {
     let (tx, rx) = mpsc::channel();
+    let (thread_id_tx, thread_id_rx) = mpsc::sync_channel(1);
+    let busy = Arc::new(AtomicBool::new(false));
+    let thread_busy = busy.clone();
     thread::spawn(move || {
-        let modifiers = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
-        if let Err(error) = unsafe { RegisterHotKey(None, HOTKEY_ID, modifiers, VK_T.0 as u32) } {
-            let _ = tx.send(HotkeyEvent::Failed(format!(
-                "Ctrl+Shift+T 注册失败：{error}"
-            )));
+        let mut message = MSG::default();
+        // Create this thread's message queue before the UI thread can post to it.
+        let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
+        let _ = thread_id_tx.send(unsafe { GetCurrentThreadId() });
+        let notify = |event: HotkeyEvent| {
+            let sent = tx.send(event).is_ok();
             ctx.request_repaint();
+            sent
+        };
+
+        let mut active = None;
+        let sent = match register(hotkey) {
+            Ok(()) => {
+                active = Some(hotkey);
+                notify(HotkeyEvent::Ready(hotkey))
+            }
+            Err(error) => notify(HotkeyEvent::Failed {
+                message: format!("{hotkey} 注册失败（可能已被其他程序占用）：{error}"),
+                active: None,
+            }),
+        };
+        if !sent {
             return;
         }
-        let _ = tx.send(HotkeyEvent::Ready);
-        ctx.request_repaint();
-        let mut message = MSG::default();
+
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
-            if message.message == WM_HOTKEY && message.wParam.0 == HOTKEY_ID as usize {
-                if tx.send(HotkeyEvent::Started).is_err() {
-                    break;
+            match message.message {
+                WM_HOTKEY if message.wParam.0 == HOTKEY_ID as usize => {
+                    // A press queued during a capture or translation must not replace that work.
+                    if thread_busy.swap(true, Ordering::AcqRel) {
+                        if !notify(HotkeyEvent::Busy) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if !notify(HotkeyEvent::Started) {
+                        break;
+                    }
+                    let result = capture_region(active);
+                    if !notify(HotkeyEvent::Captured(result)) {
+                        break;
+                    }
                 }
-                ctx.request_repaint();
-                let result = capture_region();
-                if tx.send(HotkeyEvent::Captured(result)).is_err() {
-                    break;
+                WM_SET_HOTKEY => {
+                    let requested = Hotkey::from_message(message.wParam, message.lParam);
+                    if active != Some(requested) {
+                        let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
+                        if let Err(error) = register(requested) {
+                            active = active.filter(|previous| register(*previous).is_ok());
+                            let fallback = match active {
+                                Some(previous) => format!("仍使用 {previous}"),
+                                None => "当前没有可用的全局快捷键".into(),
+                            };
+                            let failed = HotkeyEvent::Failed {
+                                message: format!(
+                                    "{requested} 注册失败（可能已被其他程序占用），{fallback}：{error}"
+                                ),
+                                active,
+                            };
+                            if !notify(failed) {
+                                break;
+                            }
+                            continue;
+                        }
+                        active = Some(requested);
+                    }
+                    if !notify(HotkeyEvent::Ready(requested)) {
+                        break;
+                    }
                 }
-                ctx.request_repaint();
+                _ => {}
             }
         }
         let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
     });
-    rx
+    HotkeyListener {
+        events: rx,
+        busy,
+        thread_id: thread_id_rx.recv().unwrap_or_default(),
+    }
 }
 
-pub fn capture_region() -> Result<PathBuf, String> {
-    let result = capture_region_inner();
+/// `hotkey` is the shortcut that triggered the capture, whose keys must be released first.
+pub fn capture_region(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
+    let result = capture_region_inner(hotkey);
     restore_main_window();
     result
 }
@@ -106,6 +311,42 @@ pub fn paste_clipboard_image() -> Result<Option<PathBuf>, String> {
     Err("剪贴板正被占用，请重试粘贴。".into())
 }
 
+/// Captures are deleted on normal exit; this removes ones left behind by a killed process.
+pub fn remove_stale_captures() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(is_capture_file_name) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_CAPTURE_AGE);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Matches only names produced by `save_image`: `ocr-translate-<pid>-<nanos>.png`.
+fn is_capture_file_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix("ocr-translate-")
+        .and_then(|rest| rest.strip_suffix(".png"))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 2
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn restore_main_window() {
     if let Ok(window) = unsafe { FindWindowW(None, w!("OCR Translate")) } {
         unsafe {
@@ -115,18 +356,48 @@ fn restore_main_window() {
     }
 }
 
-fn capture_region_inner() -> Result<PathBuf, String> {
-    // Let the global shortcut keys go before invoking the system snip shortcut.
-    let release_deadline = Instant::now() + Duration::from_secs(3);
-    while [VK_CONTROL, VK_SHIFT, VK_T]
-        .iter()
-        .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
-    {
-        if Instant::now() >= release_deadline {
-            return Err("请先松开 Ctrl+Shift+T，再重试截图。".into());
+/// Text or a bitmap copied before the snip, put back once the screenshot has been read.
+enum ClipboardBackup {
+    Text(String),
+    Image(arboard::ImageData<'static>),
+}
+
+impl ClipboardBackup {
+    fn take() -> Option<Self> {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        match clipboard.get_text() {
+            Ok(text) if !text.is_empty() => Some(Self::Text(text)),
+            _ => clipboard.get_image().ok().map(Self::Image),
         }
-        thread::sleep(Duration::from_millis(30));
     }
+
+    fn restore(self) {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return;
+        };
+        let _ = match self {
+            Self::Text(text) => clipboard.set_text(text),
+            Self::Image(image) => clipboard.set_image(image),
+        };
+    }
+}
+
+fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
+    // Let the global shortcut keys go before invoking the system snip shortcut.
+    if let Some(hotkey) = hotkey {
+        let keys = [VK_CONTROL, VK_SHIFT, VK_MENU, VIRTUAL_KEY(hotkey.key)];
+        let release_deadline = Instant::now() + Duration::from_secs(3);
+        while keys
+            .iter()
+            .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+        {
+            if Instant::now() >= release_deadline {
+                return Err(format!("请先松开 {hotkey}，再重试截图。"));
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+    let backup = ClipboardBackup::take();
     let previous_sequence = unsafe { GetClipboardSequenceNumber() };
     open_windows_snip()?;
 
@@ -160,10 +431,14 @@ fn capture_region_inner() -> Result<PathBuf, String> {
             sequence = current;
             // The screenshot app can briefly hold the clipboard open after writing it.
             for _ in 0..10 {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    if let Ok(data) = clipboard.get_image() {
-                        return save_image(data);
+                let image =
+                    arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+                if let Ok(data) = image {
+                    let saved = save_image(data);
+                    if let Some(backup) = backup {
+                        backup.restore();
                     }
+                    return saved;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -228,7 +503,7 @@ fn save_image(data: arboard::ImageData<'_>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn key_event(key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY, key_up: bool) -> INPUT {
+fn key_event(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -265,4 +540,43 @@ fn open_windows_snip() -> Result<(), String> {
         return Err("无法启动 Windows 框选截图；请确认系统支持 Win+Shift+S。".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hotkey_round_trips_through_text() {
+        for text in ["Ctrl+Shift+T", "Alt+F2", "Ctrl+Alt+Shift+7"] {
+            assert_eq!(Hotkey::parse(text).unwrap().to_string(), text);
+        }
+        assert_eq!(Hotkey::parse("shift + ctrl + t"), Some(Hotkey::default()));
+    }
+
+    #[test]
+    fn rejects_hotkeys_that_would_capture_typing() {
+        assert!(Hotkey::parse("Shift+T").is_none());
+        assert!(Hotkey::parse("T").is_none());
+        assert!(Hotkey::parse("Ctrl+T+Y").is_none());
+        assert!(Hotkey::parse("Ctrl+Enter").is_none());
+    }
+
+    #[test]
+    fn hotkey_survives_thread_message_encoding() {
+        let hotkey = Hotkey::parse("Ctrl+Alt+F12").unwrap();
+        let (wparam, lparam) = hotkey.to_message();
+        assert_eq!(Hotkey::from_message(wparam, lparam), hotkey);
+    }
+
+    #[test]
+    fn only_capture_files_are_cleaned_up() {
+        assert!(is_capture_file_name(
+            "ocr-translate-24288-1791996083384609400.png"
+        ));
+        assert!(!is_capture_file_name("ocr-translate-chinese-test.png"));
+        assert!(!is_capture_file_name("ocr-translate-1-2-3.png"));
+        assert!(!is_capture_file_name("ocr-translate-24288-17.jpg"));
+        assert!(!is_capture_file_name("other-24288-17.png"));
+    }
 }

@@ -2,6 +2,7 @@
 
 mod free_translate;
 mod screen_clip;
+mod secret_store;
 mod volcengine;
 mod windows_ocr;
 
@@ -98,6 +99,47 @@ impl Default for AppConfig {
     }
 }
 
+impl AppConfig {
+    fn secrets_mut(&mut self) -> [&mut String; 3] {
+        [
+            &mut self.api_key,
+            &mut self.volcengine_access_key,
+            &mut self.volcengine_secret_key,
+        ]
+    }
+
+    /// A copy for writing to disk, with every non-empty secret encrypted.
+    fn protected(&self) -> Result<Self, String> {
+        let mut stored = self.clone();
+        for secret in stored.secrets_mut() {
+            if !secret.is_empty() {
+                *secret = secret_store::protect(secret)?;
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Decrypts secrets read from disk. Returns whether plaintext secrets saved by an older
+    /// version were found, and whether any encrypted secret could not be decrypted.
+    fn reveal_secrets(&mut self) -> (bool, bool) {
+        let (mut plaintext, mut undecryptable) = (false, false);
+        for secret in self.secrets_mut() {
+            if secret_store::is_protected(secret) {
+                match secret_store::unprotect(secret) {
+                    Ok(plain) => *secret = plain,
+                    Err(_) => {
+                        secret.clear();
+                        undecryptable = true;
+                    }
+                }
+            } else if !secret.is_empty() {
+                plaintext = true;
+            }
+        }
+        (plaintext, undecryptable)
+    }
+}
+
 #[derive(Default, Clone)]
 struct TranslationResult {
     source_text: String,
@@ -118,7 +160,9 @@ struct OcrTranslateApp {
     temporary_capture: Option<PathBuf>,
     request_rx: Option<Receiver<RequestResult>>,
     capture_rx: Option<Receiver<Result<PathBuf, String>>>,
-    hotkey_rx: Receiver<screen_clip::HotkeyEvent>,
+    hotkey: screen_clip::HotkeyListener,
+    active_hotkey: Option<screen_clip::Hotkey>,
+    shortcut_draft: screen_clip::Hotkey,
     hotkey_capture_active: bool,
     paste_key_down: bool,
     status: String,
@@ -132,17 +176,21 @@ impl OcrTranslateApp {
     fn new(ctx: &egui::Context) -> Self {
         let config_path = config_path();
         let mut config = load_config(&config_path);
+        let (plaintext_secrets, undecryptable_secrets) = config.reveal_secrets();
         config.font_size = config
             .font_size
             .clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
+        let shortcut = screen_clip::Hotkey::parse(&config.shortcut).unwrap_or_default();
+        config.shortcut = shortcut.to_string();
         apply_appearance(ctx, &config);
+        thread::spawn(screen_clip::remove_stale_captures);
         let ocr_languages = windows_ocr::available_languages();
         if config.ocr_language != "auto"
             && !ocr_languages.iter().any(|tag| tag == &config.ocr_language)
         {
             config.ocr_language = "auto".into();
         }
-        Self {
+        let mut app = Self {
             config,
             config_path,
             result: TranslationResult::default(),
@@ -150,29 +198,63 @@ impl OcrTranslateApp {
             temporary_capture: None,
             request_rx: None,
             capture_rx: None,
-            hotkey_rx: screen_clip::listen_for_hotkey(ctx.clone()),
+            hotkey: screen_clip::listen_for_hotkey(ctx.clone(), shortcut),
+            active_hotkey: None,
+            shortcut_draft: shortcut,
             hotkey_capture_active: false,
             paste_key_down: false,
-            status: "准备就绪。按 Ctrl+Shift+T 框选屏幕。".into(),
+            status: format!("准备就绪。按 {shortcut} 框选屏幕。"),
             settings_open: true,
             show_api_key: false,
             show_volcengine_keys: false,
             ocr_languages,
+        };
+        if undecryptable_secrets {
+            app.status =
+                "已保存的密钥无法解密（可能来自其他电脑或 Windows 账户），请在设置中重新填写。"
+                    .into();
+        } else if plaintext_secrets {
+            // Re-save right away so keys written in plaintext by older versions get encrypted.
+            if let Err(error) = app.write_config() {
+                app.status = error;
+            }
         }
+        app
+    }
+
+    fn busy(&self) -> bool {
+        self.request_rx.is_some() || self.capture_rx.is_some() || self.hotkey_capture_active
+    }
+
+    fn shortcut_label(&self) -> String {
+        self.active_hotkey
+            .map_or_else(|| "全局快捷键".into(), |hotkey| hotkey.to_string())
+    }
+
+    fn write_config(&self) -> Result<(), String> {
+        const FAILED: &str = "设置保存失败，请检查应用数据目录权限。";
+        let json = serde_json::to_string_pretty(&self.config.protected()?)
+            .map_err(|_| FAILED.to_string())?;
+        if let Some(directory) = self.config_path.parent() {
+            fs::create_dir_all(directory).map_err(|_| FAILED.to_string())?;
+        }
+        fs::write(&self.config_path, json).map_err(|_| FAILED.to_string())
     }
 
     fn save_config(&mut self) {
-        match serde_json::to_string_pretty(&self.config)
-            .ok()
-            .and_then(|json| {
-                fs::create_dir_all(self.config_path.parent()?)
-                    .ok()
-                    .map(|_| json)
-            })
-            .and_then(|json| fs::write(&self.config_path, json).ok())
-        {
-            Some(_) => self.status = "设置已保存。".into(),
-            None => self.status = "设置保存失败，请检查应用数据目录权限。".into(),
+        if let Err(error) = self.shortcut_draft.validate() {
+            self.status = error;
+            return;
+        }
+        self.config.shortcut = self.shortcut_draft.to_string();
+        self.status = match self.write_config() {
+            Ok(()) => "设置已保存。".into(),
+            Err(error) => error,
+        };
+        if self.active_hotkey != Some(self.shortcut_draft) {
+            if let Err(error) = self.hotkey.change(self.shortcut_draft) {
+                self.status = error;
+            }
         }
     }
 
@@ -190,16 +272,17 @@ impl OcrTranslateApp {
     }
 
     fn start_screen_capture(&mut self, ctx: &egui::Context) {
-        if self.capture_rx.is_some() || self.hotkey_capture_active || self.request_rx.is_some() {
+        if self.busy() {
             return;
         }
         self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
         let (tx, rx) = mpsc::channel();
         self.capture_rx = Some(rx);
+        self.hotkey.set_busy(true);
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         thread::spawn(move || {
             thread::sleep(std::time::Duration::from_millis(250));
-            let _ = tx.send(screen_clip::capture_region());
+            let _ = tx.send(screen_clip::capture_region(None));
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -230,9 +313,17 @@ impl OcrTranslateApp {
     }
 
     fn poll_hotkey(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.hotkey_rx.try_recv() {
+        while let Ok(event) = self.hotkey.events.try_recv() {
             match event {
-                screen_clip::HotkeyEvent::Ready => {}
+                screen_clip::HotkeyEvent::Ready(hotkey) => {
+                    let previous = self.active_hotkey.replace(hotkey);
+                    if previous.is_some_and(|previous| previous != hotkey) {
+                        self.status = format!("全局快捷键已更新为 {hotkey}。");
+                    }
+                }
+                screen_clip::HotkeyEvent::Busy => {
+                    self.status = "上一项截图或翻译还在进行，请完成后再按快捷键。".into();
+                }
                 screen_clip::HotkeyEvent::Started => {
                     self.hotkey_capture_active = true;
                     self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
@@ -245,7 +336,19 @@ impl OcrTranslateApp {
                     self.hotkey_capture_active = false;
                     self.status = error;
                 }
-                screen_clip::HotkeyEvent::Failed(error) => self.status = error,
+                screen_clip::HotkeyEvent::Failed { message, active } => {
+                    self.status = message;
+                    self.active_hotkey = active;
+                    // The listener fell back to the previous shortcut; keep the saved setting
+                    // in step so the next launch does not retry the rejected one.
+                    if let Some(active) = active {
+                        if self.config.shortcut != active.to_string() {
+                            self.config.shortcut = active.to_string();
+                            self.shortcut_draft = active;
+                            let _ = self.write_config();
+                        }
+                    }
+                }
             }
         }
     }
@@ -262,7 +365,7 @@ impl OcrTranslateApp {
     }
 
     fn paste_image(&mut self, ctx: &egui::Context) {
-        if self.request_rx.is_some() || self.capture_rx.is_some() || self.hotkey_capture_active {
+        if self.busy() {
             return;
         }
         match screen_clip::paste_clipboard_image() {
@@ -272,25 +375,35 @@ impl OcrTranslateApp {
         }
     }
 
+    /// Returns false and opens the settings page when the selected channel lacks credentials.
+    fn ensure_credentials(&mut self) -> bool {
+        let config = &self.config;
+        let missing = match config.mode {
+            TranslationMode::Vision if config.api_key.trim().is_empty() => {
+                Some("请先填写 API Key。")
+            }
+            TranslationMode::Vision
+                if config.api_url.trim().is_empty() || config.model.trim().is_empty() =>
+            {
+                Some("请先填写 API URL 和模型名称。")
+            }
+            TranslationMode::Volcengine => {
+                let (access_key, secret_key) = volcengine_credentials(config);
+                (access_key.trim().is_empty() || secret_key.trim().is_empty())
+                    .then_some("请先在设置中填写火山引擎 Access Key 和 Secret Key。")
+            }
+            _ => None,
+        };
+        if let Some(message) = missing {
+            self.status = message.into();
+            self.settings_open = true;
+        }
+        missing.is_none()
+    }
+
     fn start_translation(&mut self, path: PathBuf, ctx: &egui::Context) {
-        if self.config.mode == TranslationMode::Vision {
-            if self.config.api_key.trim().is_empty() {
-                self.status = "请先填写 API Key。".into();
-                self.settings_open = true;
-                return;
-            }
-            if self.config.api_url.trim().is_empty() || self.config.model.trim().is_empty() {
-                self.status = "请先填写 API URL 和模型名称。".into();
-                self.settings_open = true;
-                return;
-            }
-        } else if self.config.mode == TranslationMode::Volcengine {
-            let (access_key, secret_key) = volcengine_credentials(&self.config);
-            if access_key.trim().is_empty() || secret_key.trim().is_empty() {
-                self.status = "请先在设置中填写火山引擎 Access Key 和 Secret Key。".into();
-                self.settings_open = true;
-                return;
-            }
+        if !self.ensure_credentials() {
+            return;
         }
 
         let config = self.config.clone();
@@ -308,13 +421,7 @@ impl OcrTranslateApp {
                 validate_image_size(&path)?;
                 let source = windows_ocr::recognize(&path, &config.ocr_language)?;
                 let _ = tx.send(RequestResult::Source(source.clone()));
-                let translated = if config.mode == TranslationMode::Volcengine {
-                    let target = free_translate::target_code(&config.target_language, config.mode)?;
-                    let (access_key, secret_key) = volcengine_credentials(&config);
-                    volcengine::translate(&source, target, &access_key, &secret_key)?
-                } else {
-                    free_translate::translate(&source, &config.target_language, config.mode)?
-                };
+                let translated = translate_text(&config, &source)?;
                 Ok(TranslationResult {
                     source_text: source,
                     translated_text: translated,
@@ -332,24 +439,8 @@ impl OcrTranslateApp {
             self.status = "请先在原文框输入或粘贴文字。".into();
             return;
         }
-        if self.config.mode == TranslationMode::Vision {
-            if self.config.api_key.trim().is_empty() {
-                self.status = "请先填写 API Key。".into();
-                self.settings_open = true;
-                return;
-            }
-            if self.config.api_url.trim().is_empty() || self.config.model.trim().is_empty() {
-                self.status = "请先填写 API URL 和模型名称。".into();
-                self.settings_open = true;
-                return;
-            }
-        } else if self.config.mode == TranslationMode::Volcengine {
-            let (access_key, secret_key) = volcengine_credentials(&self.config);
-            if access_key.trim().is_empty() || secret_key.trim().is_empty() {
-                self.status = "请先在设置中填写火山引擎 Access Key 和 Secret Key。".into();
-                self.settings_open = true;
-                return;
-            }
+        if !self.ensure_credentials() {
+            return;
         }
 
         let config = self.config.clone();
@@ -361,18 +452,7 @@ impl OcrTranslateApp {
 
         thread::spawn(move || {
             let result = (|| {
-                let translated = match config.mode {
-                    TranslationMode::Vision => translate_text_with_vision(&config, &source)?,
-                    TranslationMode::Volcengine => {
-                        let target =
-                            free_translate::target_code(&config.target_language, config.mode)?;
-                        let (access_key, secret_key) = volcengine_credentials(&config);
-                        volcengine::translate(&source, target, &access_key, &secret_key)?
-                    }
-                    TranslationMode::Tencent | TranslationMode::Google => {
-                        free_translate::translate(&source, &config.target_language, config.mode)?
-                    }
-                };
+                let translated = translate_text(&config, &source)?;
                 Ok(TranslationResult {
                     source_text: source,
                     translated_text: translated,
@@ -558,7 +638,32 @@ impl OcrTranslateApp {
         }
         ui.add_space(8.0);
 
-        ui.label("全局截图快捷键：Ctrl+Shift+T（应用运行期间有效）");
+        ui.label("全局截图快捷键");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.shortcut_draft.ctrl, "Ctrl");
+            ui.checkbox(&mut self.shortcut_draft.alt, "Alt");
+            ui.checkbox(&mut self.shortcut_draft.shift, "Shift");
+            egui::ComboBox::from_id_salt("shortcut_key")
+                .selected_text(screen_clip::Hotkey::key_name(self.shortcut_draft.key))
+                .show_ui(ui, |ui| {
+                    for key in screen_clip::Hotkey::key_choices() {
+                        ui.selectable_value(
+                            &mut self.shortcut_draft.key,
+                            key,
+                            screen_clip::Hotkey::key_name(key),
+                        );
+                    }
+                });
+        });
+        match (self.shortcut_draft.validate(), self.active_hotkey) {
+            (Err(error), _) => ui.small(error),
+            (Ok(()), Some(active)) if active != self.shortcut_draft => ui.small(format!(
+                "当前生效：{active}。点击“保存设置”后改为 {}。",
+                self.shortcut_draft
+            )),
+            (Ok(()), Some(_)) => ui.small("应用运行期间在任何窗口都有效。"),
+            (Ok(()), None) => ui.small("当前没有生效的全局快捷键，点击“保存设置”重试注册。"),
+        };
         ui.add_space(14.0);
 
         if ui.button("保存设置").clicked() {
@@ -571,50 +676,34 @@ impl OcrTranslateApp {
     fn draw_result(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("截图翻译");
         ui.add_space(4.0);
-        ui.label("按 Ctrl+Shift+T 框选屏幕，选择图片，或直接输入原文翻译。");
+        ui.label(format!(
+            "按 {} 框选屏幕，选择图片，或直接输入原文翻译。",
+            self.shortcut_label()
+        ));
         ui.add_space(12.0);
 
+        let idle = !self.busy();
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(
-                    self.request_rx.is_none()
-                        && self.capture_rx.is_none()
-                        && !self.hotkey_capture_active,
-                    egui::Button::new("框选屏幕"),
-                )
+                .add_enabled(idle, egui::Button::new("框选屏幕"))
                 .clicked()
             {
                 self.start_screen_capture(ctx);
             }
             if ui
-                .add_enabled(
-                    self.request_rx.is_none()
-                        && self.capture_rx.is_none()
-                        && !self.hotkey_capture_active,
-                    egui::Button::new("选择截图 / 图片"),
-                )
+                .add_enabled(idle, egui::Button::new("选择截图 / 图片"))
                 .clicked()
             {
                 self.choose_image(ctx);
             }
             if ui
-                .add_enabled(
-                    self.request_rx.is_none()
-                        && self.capture_rx.is_none()
-                        && !self.hotkey_capture_active,
-                    egui::Button::new("翻译原文"),
-                )
+                .add_enabled(idle, egui::Button::new("翻译原文"))
                 .clicked()
             {
                 self.start_text_translation(ctx);
             }
             if ui
-                .add_enabled(
-                    self.request_rx.is_none()
-                        && self.capture_rx.is_none()
-                        && !self.hotkey_capture_active,
-                    egui::Button::new("重新翻译"),
-                )
+                .add_enabled(idle, egui::Button::new("重新翻译"))
                 .clicked()
             {
                 if let Some(path) = self.selected_file.clone() {
@@ -703,6 +792,7 @@ impl eframe::App for OcrTranslateApp {
                 self.draw_result(ui, ctx);
             }
         });
+        self.hotkey.set_busy(self.busy());
     }
 }
 
@@ -742,6 +832,20 @@ fn volcengine_credentials(config: &AppConfig) -> (String, String) {
     (access_key, secret_key)
 }
 
+fn translate_text(config: &AppConfig, source: &str) -> Result<String, String> {
+    match config.mode {
+        TranslationMode::Vision => translate_text_with_vision(config, source),
+        TranslationMode::Volcengine => {
+            let target = free_translate::target_code(&config.target_language, config.mode)?;
+            let (access_key, secret_key) = volcengine_credentials(config);
+            volcengine::translate(source, target, &access_key, &secret_key)
+        }
+        TranslationMode::Tencent | TranslationMode::Google => {
+            free_translate::translate(source, &config.target_language, config.mode)
+        }
+    }
+}
+
 fn translate_image(config: &AppConfig, path: &Path) -> Result<TranslationResult, String> {
     validate_image_size(path)?;
     let bytes = fs::read(path).map_err(|error| format!("读取图片失败：{error}"))?;
@@ -762,18 +866,33 @@ fn translate_image(config: &AppConfig, path: &Path) -> Result<TranslationResult,
         "识别图片中的所有可读文字，并翻译成{}。只返回严格 JSON，不要 Markdown，不要额外说明，格式为 {{\"source_text\":\"原文\",\"translated_text\":\"译文\"}}。保留原文换行。",
         config.target_language
     );
+    chat_completion(
+        config,
+        serde_json::json!([
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_data}}
+        ]),
+    )
+}
+
+fn translate_text_with_vision(config: &AppConfig, source: &str) -> Result<String, String> {
+    let prompt = format!(
+        "将下面的原文翻译成{}。只返回严格 JSON，不要 Markdown，不要额外说明，格式为 {{\"source_text\":\"原文\",\"translated_text\":\"译文\"}}。原文如下：\n{}",
+        config.target_language, source
+    );
+    Ok(chat_completion(config, Value::String(prompt))?.translated_text)
+}
+
+/// Sends one user message to the OpenAI-compatible endpoint and parses the JSON reply.
+fn chat_completion(config: &AppConfig, content: Value) -> Result<TranslationResult, String> {
     let body = serde_json::json!({
         "model": config.model,
         "temperature": 0,
         "messages": [{
             "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_data}}
-            ]
+            "content": content
         }]
     });
-
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(120))
@@ -793,40 +912,6 @@ fn translate_image(config: &AppConfig, path: &Path) -> Result<TranslationResult,
         return Err(format!("接口返回 {}：{}", status, compact_error(&text)));
     }
     parse_translation_response(&text)
-}
-
-fn translate_text_with_vision(config: &AppConfig, source: &str) -> Result<String, String> {
-    let prompt = format!(
-        "将下面的原文翻译成{}。只返回严格 JSON，不要 Markdown，不要额外说明，格式为 {{\"source_text\":\"原文\",\"translated_text\":\"译文\"}}。原文如下：\n{}",
-        config.target_language, source
-    );
-    let body = serde_json::json!({
-        "model": config.model,
-        "temperature": 0,
-        "messages": [{
-            "role": "user",
-            "content": prompt
-        }]
-    });
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|error| format!("创建网络客户端失败：{error}"))?;
-    let response = client
-        .post(&config.api_url)
-        .bearer_auth(&config.api_key)
-        .json(&body)
-        .send()
-        .map_err(|error| format!("请求失败：{error}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .map_err(|error| format!("读取响应失败：{error}"))?;
-    if !status.is_success() {
-        return Err(format!("接口返回 {}：{}", status, compact_error(&text)));
-    }
-    Ok(parse_translation_response(&text)?.translated_text)
 }
 
 fn validate_image_size(path: &Path) -> Result<(), String> {
@@ -926,6 +1011,23 @@ fn install_chinese_font(ctx: &egui::Context) {
     }
 }
 
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 720.0])
+            .with_min_inner_size([760.0, 520.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "OCR Translate",
+        options,
+        Box::new(|cc| {
+            install_chinese_font(&cc.egui_ctx);
+            Ok(Box::new(OcrTranslateApp::new(&cc.egui_ctx)))
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,29 +1068,47 @@ mod tests {
 
     #[test]
     fn appearance_settings_round_trip() {
-        let mut config = AppConfig::default();
-        config.theme = ThemeMode::Day;
-        config.font_size = 18;
+        let config = AppConfig {
+            theme: ThemeMode::Day,
+            font_size: 18,
+            ..Default::default()
+        };
         let restored: AppConfig =
             serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
         assert_eq!(restored.theme, ThemeMode::Day);
         assert_eq!(restored.font_size, 18);
     }
-}
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([760.0, 520.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "OCR Translate",
-        options,
-        Box::new(|cc| {
-            install_chinese_font(&cc.egui_ctx);
-            Ok(Box::new(OcrTranslateApp::new(&cc.egui_ctx)))
-        }),
-    )
+    #[test]
+    fn saved_config_encrypts_secrets_and_reveals_them_on_load() {
+        let config = AppConfig {
+            api_key: "vision-key".into(),
+            volcengine_access_key: "access-key".into(),
+            volcengine_secret_key: "secret-key".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config.protected().unwrap()).unwrap();
+        assert!(!json.contains("vision-key") && !json.contains("secret-key"));
+
+        let mut loaded: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.reveal_secrets(), (false, false));
+        assert_eq!(loaded.api_key, "vision-key");
+        assert_eq!(loaded.volcengine_access_key, "access-key");
+        assert_eq!(loaded.volcengine_secret_key, "secret-key");
+    }
+
+    #[test]
+    fn plaintext_secrets_from_old_versions_are_flagged_for_migration() {
+        let mut config: AppConfig =
+            serde_json::from_str(r#"{"volcengine_secret_key":"old-plaintext"}"#).unwrap();
+        assert_eq!(config.reveal_secrets(), (true, false));
+        assert_eq!(config.volcengine_secret_key, "old-plaintext");
+    }
+
+    #[test]
+    fn undecryptable_secrets_are_cleared() {
+        let mut config: AppConfig = serde_json::from_str(r#"{"api_key":"dpapi:AAAA"}"#).unwrap();
+        assert_eq!(config.reveal_secrets(), (false, true));
+        assert!(config.api_key.is_empty());
+    }
 }
