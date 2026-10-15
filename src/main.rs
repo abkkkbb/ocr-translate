@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dictionary;
 mod free_translate;
 mod layout;
 mod net;
@@ -257,6 +258,8 @@ struct TranslationResult {
     translated_text: String,
     /// Block positions and translations for painting the result over the screenshot.
     layout: Option<Arc<layout::ImageLayout>>,
+    /// Phonetics and parts of speech when the source is a single English word.
+    dictionary: Option<Arc<dictionary::Entry>>,
 }
 
 enum RequestResult {
@@ -578,9 +581,10 @@ impl OcrTranslateApp {
                     source_text: source,
                     translated_text: page.translated_text(),
                     layout: Some(Arc::new(page)),
+                    dictionary: None,
                 })
             })()
-            .map(RequestResult::Success)
+            .map(|result| RequestResult::Success(with_dictionary(&config, result)))
             .unwrap_or_else(RequestResult::Error);
             let _ = tx.send(result);
         });
@@ -610,9 +614,10 @@ impl OcrTranslateApp {
                     source_text: source,
                     translated_text: translated,
                     layout: None,
+                    dictionary: None,
                 })
             })()
-            .map(RequestResult::Success)
+            .map(|result| RequestResult::Success(with_dictionary(&config, result)))
             .unwrap_or_else(RequestResult::Error);
             let _ = tx.send(result);
         });
@@ -1102,6 +1107,15 @@ impl OcrTranslateApp {
             }
         });
         ui.add_space(14.0);
+        if let Some(entry) = self.result.dictionary.clone() {
+            card(ui, &palette, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("dictionary")
+                    .max_height(220.0)
+                    .show(ui, |ui| draw_dictionary(ui, &palette, &entry));
+            });
+            ui.add_space(14.0);
+        }
 
         let paste_released = ui.input(|input| {
             input.events.iter().any(|event| {
@@ -1362,6 +1376,11 @@ impl OcrTranslateApp {
                             .wrap()
                             .selectable(true),
                     );
+                    if let Some(entry) = &self.result.dictionary {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        draw_dictionary(ui, palette, entry);
+                    }
                 } else if self.busy() {
                     ui.label(RichText::new("正在识别并翻译…").color(palette.muted));
                 } else {
@@ -1591,6 +1610,17 @@ fn translate_lines(config: &AppConfig, texts: &[String]) -> Result<Vec<String>, 
     Ok(translations)
 }
 
+/// Adds dictionary details for a single English word translated into Chinese. A failed lookup
+/// leaves the translation as it is.
+fn with_dictionary(config: &AppConfig, mut result: TranslationResult) -> TranslationResult {
+    if config.target_language.contains('中')
+        && dictionary::is_single_english_word(&result.source_text)
+    {
+        result.dictionary = dictionary::lookup(&result.source_text).map(Arc::new);
+    }
+    result
+}
+
 fn translate_text(config: &AppConfig, source: &str) -> Result<String, String> {
     match config.mode {
         TranslationMode::Vision => translate_text_with_vision(config, source),
@@ -1715,6 +1745,7 @@ fn parse_translation_response(text: &str) -> Result<TranslationResult, String> {
         source_text: source.into(),
         translated_text: translated.into(),
         layout: None,
+        dictionary: None,
     })
 }
 
@@ -1905,6 +1936,60 @@ fn paint_translated_capture(
     }
 }
 
+fn draw_dictionary(ui: &mut egui::Ui, palette: &Palette, entry: &dictionary::Entry) {
+    ui.horizontal_wrapped(|ui| {
+        let size = ui.style().text_styles[&egui::TextStyle::Body].size + 4.0;
+        ui.label(
+            RichText::new(&entry.word)
+                .size(size)
+                .strong()
+                .color(palette.text),
+        );
+        for (label, phonetic) in [("英", &entry.uk_phonetic), ("美", &entry.us_phonetic)] {
+            if let Some(phonetic) = phonetic {
+                ui.label(RichText::new(format!("{label} /{phonetic}/")).color(palette.muted));
+            }
+        }
+    });
+    for (pos, meaning) in &entry.senses {
+        ui.horizontal_top(|ui| {
+            if !pos.is_empty() {
+                ui.label(RichText::new(pos).strong().color(palette.accent));
+            }
+            ui.add(
+                egui::Label::new(RichText::new(meaning).color(palette.text))
+                    .wrap()
+                    .selectable(true),
+            );
+        });
+    }
+    if !entry.forms.is_empty() {
+        let forms: Vec<String> = entry
+            .forms
+            .iter()
+            .map(|(name, value)| format!("{name} {value}"))
+            .collect();
+        hint(ui, palette, &forms.join(" · "));
+    }
+    if !entry.examples.is_empty() {
+        egui::CollapsingHeader::new(
+            RichText::new(format!("例句（{}）", entry.examples.len())).color(palette.accent),
+        )
+        .id_salt(("examples", &entry.word))
+        .show(ui, |ui| {
+            for (english, chinese) in &entry.examples {
+                ui.add(
+                    egui::Label::new(RichText::new(english).color(palette.text))
+                        .wrap()
+                        .selectable(true),
+                );
+                ui.add(egui::Label::new(RichText::new(chinese).color(palette.muted)).wrap());
+                ui.add_space(4.0);
+            }
+        });
+    }
+}
+
 /// `16207` → "1.6 万", `2000000` → "200 万", small numbers as they are.
 fn format_chars(chars: f64) -> String {
     if chars >= 10_000.0 {
@@ -2065,10 +2150,11 @@ fn text_card(
 
 /// System fonts tried after egui's built-in Latin font, in order. Each entry is a list of
 /// alternatives; the first one present is used. Microsoft YaHei has no Hangul, so Malgun Gothic
-/// follows it to cover Korean.
-const FALLBACK_FONTS: [(&str, &[&str]); 2] = [
+/// follows it to cover Korean; Segoe UI covers the IPA symbols in dictionary phonetics.
+const FALLBACK_FONTS: [(&str, &[&str]); 3] = [
     ("Windows CJK", &["msyh.ttc", "Deng.ttf", "simhei.ttf"]),
     ("Windows Korean", &["malgun.ttf", "gulim.ttc"]),
+    ("Windows Latin", &["segoeui.ttf", "arial.ttf"]),
 ];
 
 fn install_system_fonts(ctx: &egui::Context) {
