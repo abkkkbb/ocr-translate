@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod free_translate;
+mod layout;
 mod screen_clip;
 mod secret_store;
 mod volcengine;
@@ -165,7 +166,12 @@ struct ResultPopup {
     copied: bool,
     /// Physical rectangle last requested for the window, to tell clicks inside from outside.
     placed: Option<egui::Rect>,
+    width: f32,
     height: f32,
+    /// Image view (translation painted over the capture) or text view; decided per result.
+    image_view: Option<bool>,
+    /// The capture uploaded for the image view, keyed by the layout it came from.
+    texture: Option<(usize, egui::TextureHandle)>,
     escape_was_down: bool,
     click_was_down: bool,
 }
@@ -181,7 +187,10 @@ impl ResultPopup {
             show_source: false,
             copied: false,
             placed: None,
+            width: POPUP_WIDTH,
             height: 120.0,
+            image_view: None,
+            texture: None,
             escape_was_down: screen_clip::escape_down(),
             click_was_down: screen_clip::mouse_button_down(),
         }
@@ -234,6 +243,8 @@ impl ResultPopup {
 struct TranslationResult {
     source_text: String,
     translated_text: String,
+    /// Block positions and translations for painting the result over the screenshot.
+    layout: Option<Arc<layout::ImageLayout>>,
 }
 
 enum RequestResult {
@@ -525,12 +536,24 @@ impl OcrTranslateApp {
                     return translate_image(&config, &path);
                 }
                 validate_image_size(&path)?;
-                let source = windows_ocr::recognize(&path, &config.ocr_language)?;
+                let lines = windows_ocr::recognize_lines(&path, &config.ocr_language)?;
+                let mut page = layout::ImageLayout::build(&path, lines)?;
+                let source = page.source_text();
                 let _ = tx.send(RequestResult::Source(source.clone()));
-                let translated = translate_text(&config, &source)?;
+                // Each block is translated on its own so the result maps back onto the image.
+                let indexes = page.translatable();
+                let texts: Vec<String> = indexes
+                    .iter()
+                    .map(|&index| page.blocks[index].source.clone())
+                    .collect();
+                for (index, translated) in indexes.into_iter().zip(translate_many(&config, &texts)?)
+                {
+                    page.blocks[index].translated = Some(translated);
+                }
                 Ok(TranslationResult {
                     source_text: source,
-                    translated_text: translated,
+                    translated_text: page.translated_text(),
+                    layout: Some(Arc::new(page)),
                 })
             })()
             .map(RequestResult::Success)
@@ -562,6 +585,7 @@ impl OcrTranslateApp {
                 Ok(TranslationResult {
                     source_text: source,
                     translated_text: translated,
+                    layout: None,
                 })
             })()
             .map(RequestResult::Success)
@@ -961,7 +985,43 @@ impl OcrTranslateApp {
         }
         let palette = Palette::of(self.config.theme);
         let root_scale = ctx.pixels_per_point();
-        let initial = popup.place(egui::vec2(POPUP_WIDTH, popup.height) * root_scale);
+        let page = self.result.layout.clone().filter(|_| !self.busy());
+        if let Some(page) = &page {
+            // Scattered text such as cards reads better in place; prose reads better as text.
+            popup.image_view.get_or_insert(page.dispersed);
+            let key = Arc::as_ptr(page) as usize;
+            if popup
+                .texture
+                .as_ref()
+                .is_none_or(|(loaded, _)| *loaded != key)
+            {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [page.width as usize, page.height as usize],
+                    &page.rgba,
+                );
+                let texture = ctx.load_texture("capture", image, egui::TextureOptions::LINEAR);
+                popup.texture = Some((key, texture));
+            }
+        }
+        let image_view = page.is_some() && popup.image_view == Some(true);
+        // Show the capture at its real size, shrunk to fit two thirds of the monitor.
+        let [left, top, right, bottom] = popup.work_area.map(|value| value as f32 / root_scale);
+        let image_size = page.as_ref().map(|page| {
+            let natural = egui::vec2(page.width as f32, page.height as f32) / root_scale;
+            let limit = egui::vec2((right - left) * 0.66, (bottom - top) * 0.75 - 80.0);
+            natural * (limit.x / natural.x).min(limit.y / natural.y).min(1.0)
+        });
+        popup.width = match image_size {
+            Some(size) if image_view => (size.x + 2.0 * f32::from(POPUP_MARGIN)).max(POPUP_WIDTH),
+            _ => POPUP_WIDTH,
+        };
+        let max_height = if image_view {
+            (bottom - top) * 0.9
+        } else {
+            POPUP_MAX_HEIGHT
+        };
+        let width = popup.width;
+        let initial = popup.place(egui::vec2(width, popup.height) * root_scale);
         let builder = egui::ViewportBuilder::default()
             .with_title("OCR Translate 译文")
             .with_decorations(false)
@@ -969,7 +1029,7 @@ impl OcrTranslateApp {
             .with_always_on_top()
             .with_taskbar(false)
             .with_active(false)
-            .with_inner_size([POPUP_WIDTH, popup.height])
+            .with_inner_size([width, popup.height])
             .with_position([initial.x / root_scale, initial.y / root_scale]);
         let mut close = false;
         let mut open_main_window = false;
@@ -990,6 +1050,7 @@ impl OcrTranslateApp {
                                 ui,
                                 &palette,
                                 &mut popup,
+                                image_size.filter(|_| image_view),
                                 &mut close,
                                 &mut open_main_window,
                             )
@@ -1002,17 +1063,16 @@ impl OcrTranslateApp {
 
                 // Fit the window to its content and keep it inside the monitor's work area.
                 let height =
-                    (content_height + 2.0 * f32::from(POPUP_MARGIN)).clamp(80.0, POPUP_MAX_HEIGHT);
+                    (content_height + 2.0 * f32::from(POPUP_MARGIN)).clamp(80.0, max_height);
                 let scale = ctx.pixels_per_point();
-                let size = egui::vec2(POPUP_WIDTH, height) * scale;
+                let size = egui::vec2(width, height) * scale;
                 let corner = popup.place(size);
                 let rect = egui::Rect::from_min_size(corner, size);
                 if popup.placed != Some(rect) {
                     popup.placed = Some(rect);
                     popup.height = height;
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        POPUP_WIDTH,
-                        height,
+                        width, height,
                     )));
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                         corner.x / scale,
@@ -1042,6 +1102,7 @@ impl OcrTranslateApp {
         ui: &mut egui::Ui,
         palette: &Palette,
         popup: &mut ResultPopup,
+        image_size: Option<egui::Vec2>,
         close: &mut bool,
         open_main_window: &mut bool,
     ) {
@@ -1055,6 +1116,16 @@ impl OcrTranslateApp {
             if self.busy() {
                 ui.add(egui::Spinner::new().size(12.0).color(palette.accent));
                 ui.label(RichText::new(&self.status).small().color(palette.muted));
+            } else if self.result.layout.is_some() && popup.texture.is_some() {
+                let mut image_view = popup.image_view == Some(true);
+                if segmented(
+                    ui,
+                    palette,
+                    &mut image_view,
+                    &[(true, "图片"), (false, "文字")],
+                ) {
+                    popup.image_view = Some(image_view);
+                }
             } else {
                 ui.label(RichText::new("译文").small().strong().color(palette.muted));
             }
@@ -1083,6 +1154,22 @@ impl OcrTranslateApp {
             });
         });
         ui.add_space(4.0);
+
+        if let (Some(size), Some(page), Some((_, texture))) =
+            (image_size, &self.result.layout, &popup.texture)
+        {
+            paint_translated_capture(ui, texture, page, size, popup.show_source);
+            ui.add_space(2.0);
+            let label = if popup.show_source {
+                "显示译文"
+            } else {
+                "对比原图"
+            };
+            if action(ui, label, palette.accent) {
+                popup.show_source = !popup.show_source;
+            }
+            return;
+        }
 
         egui::ScrollArea::vertical()
             .max_height(POPUP_MAX_HEIGHT - 110.0)
@@ -1252,6 +1339,76 @@ fn volcengine_credentials(config: &AppConfig) -> (String, String) {
     (access_key, secret_key)
 }
 
+/// Translates each text separately, returning one translation per input in order.
+fn translate_many(config: &AppConfig, texts: &[String]) -> Result<Vec<String>, String> {
+    match config.mode {
+        TranslationMode::Volcengine => {
+            let target = free_translate::target_code(&config.target_language, config.mode)?;
+            let (access_key, secret_key) = volcengine_credentials(config);
+            volcengine::translate_list(texts, target, &access_key, &secret_key)
+        }
+        TranslationMode::Vision => texts
+            .iter()
+            .map(|text| translate_text(config, text))
+            .collect(),
+        TranslationMode::Tencent | TranslationMode::Google => {
+            // Send a few lines per request, keeping URL-based providers under their size limit.
+            let mut translations = Vec::with_capacity(texts.len());
+            let mut start = 0;
+            while start < texts.len() {
+                let mut end = start + 1;
+                let mut length = texts[start].len();
+                while end < texts.len() && length + texts[end].len() < 1500 {
+                    length += texts[end].len() + 1;
+                    end += 1;
+                }
+                translations.extend(translate_lines(config, &texts[start..end])?);
+                start = end;
+            }
+            Ok(translations)
+        }
+    }
+}
+
+/// Joins texts with line breaks in one request. If the provider merges or splits lines, falls
+/// back to translating each text on its own, a few at a time.
+fn translate_lines(config: &AppConfig, texts: &[String]) -> Result<Vec<String>, String> {
+    if texts.len() > 1 {
+        let joined =
+            free_translate::translate(&texts.join("\n"), &config.target_language, config.mode)?;
+        let lines: Vec<String> = joined
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if lines.len() == texts.len() {
+            return Ok(lines);
+        }
+    }
+    let mut translations = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(6) {
+        let results: Vec<Result<String, String>> = thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|text| scope.spawn(|| translate_text(config, text)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("翻译任务意外结束。".into()))
+                })
+                .collect()
+        });
+        for result in results {
+            translations.push(result?);
+        }
+    }
+    Ok(translations)
+}
+
 fn translate_text(config: &AppConfig, source: &str) -> Result<String, String> {
     match config.mode {
         TranslationMode::Vision => translate_text_with_vision(config, source),
@@ -1375,6 +1532,7 @@ fn parse_translation_response(text: &str) -> Result<TranslationResult, String> {
     Ok(TranslationResult {
         source_text: source.into(),
         translated_text: translated.into(),
+        layout: None,
     })
 }
 
@@ -1506,6 +1664,63 @@ fn apply_appearance(ctx: &egui::Context, config: &AppConfig) {
     style.visuals.slider_trailing_fill = true;
     ctx.set_style(style);
     ctx.request_repaint();
+}
+
+/// Draws the capture and, unless `original` is set, paints each translated block over its
+/// source text in the sampled colours. Hovering a block shows its source text.
+fn paint_translated_capture(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    page: &layout::ImageLayout,
+    size: egui::Vec2,
+    original: bool,
+) {
+    const MIN_FONT: f32 = 7.0;
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    painter.image(texture.id(), rect, uv, Color32::WHITE);
+    let scale = size.x / page.width as f32;
+    let mut hovered = None;
+    for block in &page.blocks {
+        let [x, y, width, height] = block.rect;
+        let area = egui::Rect::from_min_size(
+            rect.min + egui::vec2(x, y) * scale,
+            egui::vec2(width, height) * scale,
+        );
+        if response
+            .hover_pos()
+            .is_some_and(|pointer| area.contains(pointer))
+        {
+            hovered = Some(block.source.clone());
+        }
+        let Some(text) = block.translated.as_ref().filter(|_| !original) else {
+            continue;
+        };
+        let [r, g, b] = block.background;
+        painter.rect_filled(area.expand(2.0), 2.0, Color32::from_rgb(r, g, b));
+        let [r, g, b] = block.foreground;
+        let color = Color32::from_rgb(r, g, b);
+        // Start near the source font size and shrink until the text fits the source box.
+        let mut font_size = (block.line_height * scale * 0.95).max(MIN_FONT);
+        let galley = loop {
+            let galley = painter.layout(
+                text.clone(),
+                egui::FontId::proportional(font_size),
+                color,
+                area.width().max(1.0),
+            );
+            if galley.size().y <= area.height() * 1.15 || font_size <= MIN_FONT {
+                break galley;
+            }
+            font_size = (font_size * 0.9).max(MIN_FONT);
+        };
+        let top = area.center().y - galley.size().y / 2.0;
+        painter.galley(egui::pos2(area.left(), top), galley, color);
+    }
+    if let Some(source) = hovered {
+        response.on_hover_text(source);
+    }
 }
 
 fn card<R>(
@@ -1786,7 +2001,10 @@ mod tests {
             show_source: false,
             copied: false,
             placed: None,
+            width: POPUP_WIDTH,
             height: 120.0,
+            image_view: None,
+            texture: None,
             escape_was_down: false,
             click_was_down: false,
         }

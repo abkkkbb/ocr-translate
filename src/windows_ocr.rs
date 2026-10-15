@@ -6,7 +6,7 @@ use windows::{
         BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, BitmapTransform, ColorManagementMode,
         ExifOrientationMode,
     },
-    Media::Ocr::OcrEngine,
+    Media::Ocr::{OcrEngine, OcrResult},
     Storage::StorageFile,
 };
 
@@ -24,7 +24,43 @@ pub fn available_languages() -> Vec<String> {
         .collect()
 }
 
-pub fn recognize(path: &Path, language_tag: &str) -> Result<String, String> {
+const NO_TEXT: &str = "没有识别到文字。请换一张清晰图片，或切换原文识别语言。";
+
+/// One recognized word and its box `[x, y, width, height]` in original image pixels.
+#[derive(Clone, Debug)]
+pub struct Word {
+    pub text: String,
+    pub rect: [f32; 4],
+}
+
+/// Recognized lines, each a list of words with their positions.
+pub fn recognize_lines(path: &Path, language_tag: &str) -> Result<Vec<Vec<Word>>, String> {
+    let (result, scale) = run(path, language_tag)?;
+    let read = |error: windows::core::Error| format!("读取 OCR 结果失败：{error}");
+    let mut lines = Vec::new();
+    for line in result.Lines().map_err(read)? {
+        let mut words = Vec::new();
+        for word in line.Words().map_err(read)? {
+            let rect = word.BoundingRect().map_err(read)?;
+            words.push(Word {
+                text: word.Text().map_err(read)?.to_string(),
+                // OCR ran on a downscaled bitmap when the image was too large.
+                rect: [rect.X, rect.Y, rect.Width, rect.Height].map(|value| value / scale),
+            });
+        }
+        if !words.is_empty() {
+            lines.push(words);
+        }
+    }
+    if lines.is_empty() {
+        Err(NO_TEXT.into())
+    } else {
+        Ok(lines)
+    }
+}
+
+/// Runs OCR and returns the result with the factor the image was scaled by before recognition.
+fn run(path: &Path, language_tag: &str) -> Result<(OcrResult, f32), String> {
     let engine = if language_tag == "auto" {
         OcrEngine::TryCreateFromUserProfileLanguages()
     } else {
@@ -49,8 +85,8 @@ pub fn recognize(path: &Path, language_tag: &str) -> Result<String, String> {
     let width = decoder.PixelWidth().map_err(|error| error.to_string())?;
     let height = decoder.PixelHeight().map_err(|error| error.to_string())?;
     let max = OcrEngine::MaxImageDimension().map_err(|error| error.to_string())?;
-    let bitmap = if width.max(height) > max {
-        let scale = max as f64 / width.max(height) as f64;
+    let scale = (max as f64 / width.max(height) as f64).min(1.0);
+    let bitmap = if scale < 1.0 {
         let transform = BitmapTransform::new().map_err(|error| error.to_string())?;
         transform
             .SetScaledWidth(((width as f64 * scale).round() as u32).max(1))
@@ -78,50 +114,5 @@ pub fn recognize(path: &Path, language_tag: &str) -> Result<String, String> {
         .RecognizeAsync(&bitmap)
         .and_then(|operation| operation.get())
         .map_err(|error| format!("Windows OCR 识别失败：{error}"))?;
-    let text = result
-        .Text()
-        .map_err(|error| format!("读取 OCR 结果失败：{error}"))?
-        .to_string();
-    let text = normalize_cjk_spacing(&text);
-    if text.trim().is_empty() {
-        Err("没有识别到文字。请换一张清晰图片，或切换原文识别语言。".into())
-    } else {
-        Ok(text)
-    }
-}
-
-fn normalize_cjk_spacing(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut normalized = String::with_capacity(text.len());
-    for (index, character) in chars.iter().enumerate() {
-        if *character == ' '
-            && index > 0
-            && is_han(chars[index - 1])
-            && chars[index + 1..]
-                .iter()
-                .find(|next| **next != ' ')
-                .is_some_and(|next| is_han(*next))
-        {
-            continue;
-        }
-        normalized.push(*character);
-    }
-    normalized
-}
-
-fn is_han(character: char) -> bool {
-    matches!(character, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn removes_windows_ocr_spaces_between_han_characters() {
-        assert_eq!(
-            normalize_cjk_spacing("你 好 世 界\nHello world"),
-            "你好世界\nHello world"
-        );
-    }
+    Ok((result, scale as f32))
 }

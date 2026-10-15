@@ -10,16 +10,52 @@ const REGION: &str = "cn-beijing";
 const SERVICE: &str = "translate";
 const QUERY: &str = "Action=TranslateText&Version=2025-03-01";
 
+/// Texts per request; the API caps the list length.
+const BATCH_SIZE: usize = 16;
+
 pub fn translate(
     text: &str,
     target: &str,
     access_key: &str,
     secret_key: &str,
 ) -> Result<String, String> {
+    let translations = translate_list(&[text.to_owned()], target, access_key, secret_key)?;
+    let text = translations.join("\n");
+    if text.trim().is_empty() {
+        Err("火山翻译返回了空译文。".into())
+    } else {
+        Ok(text)
+    }
+}
+
+/// Translates each text separately, returning one translation per input in the same order.
+pub fn translate_list(
+    texts: &[String],
+    target: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<Vec<String>, String> {
     if access_key.trim().is_empty() || secret_key.trim().is_empty() {
         return Err("请先填写火山引擎 Access Key 和 Secret Key。".into());
     }
-    let body = serde_json::json!({ "TargetLanguage": target, "TextList": [text] });
+    let mut translations = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(BATCH_SIZE) {
+        let batch = request(chunk, target, access_key, secret_key)?;
+        if batch.len() != chunk.len() {
+            return Err("火山翻译返回的译文数量与原文不一致。".into());
+        }
+        translations.extend(batch);
+    }
+    Ok(translations)
+}
+
+fn request(
+    texts: &[String],
+    target: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<Vec<String>, String> {
+    let body = serde_json::json!({ "TargetLanguage": target, "TextList": texts });
     let body =
         serde_json::to_string(&body).map_err(|error| format!("创建火山请求失败：{error}"))?;
     let date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -82,7 +118,7 @@ fn mac(key: &[u8], message: &str) -> Vec<u8> {
     signer.finalize().into_bytes().to_vec()
 }
 
-fn parse_response(body: &str) -> Result<String, String> {
+fn parse_response(body: &str) -> Result<Vec<String>, String> {
     let response: Value =
         serde_json::from_str(body).map_err(|error| format!("火山翻译响应无效：{error}"))?;
     if let Some(error) = response["ResponseMetadata"]["Error"]["Message"].as_str() {
@@ -92,16 +128,10 @@ fn parse_response(body: &str) -> Result<String, String> {
         .as_array()
         .or_else(|| response["TranslationList"].as_array())
         .ok_or_else(|| format!("火山翻译没有返回译文：{}", super::compact_error(body)))?;
-    let text = translations
+    Ok(translations
         .iter()
-        .filter_map(|item| item["Translation"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() {
-        Err("火山翻译返回了空译文。".into())
-    } else {
-        Ok(text)
-    }
+        .map(|item| item["Translation"].as_str().unwrap_or_default().to_owned())
+        .collect())
 }
 
 #[cfg(test)]
@@ -111,8 +141,11 @@ mod tests {
     #[test]
     fn parses_result_wrapper() {
         assert_eq!(
-            parse_response(r#"{"Result":{"TranslationList":[{"Translation":"你好"}]}}"#).unwrap(),
-            "你好"
+            parse_response(
+                r#"{"Result":{"TranslationList":[{"Translation":"你好"},{"Translation":"世界"}]}}"#
+            )
+            .unwrap(),
+            ["你好", "世界"]
         );
     }
 

@@ -8,8 +8,17 @@ fn main() {
         return;
     };
     let language = std::env::args().nth(2).unwrap_or_else(|| "auto".into());
-    match windows_ocr::recognize(std::path::Path::new(&path), &language) {
-        Ok(text) => println!("Recognized text:\n{text}"),
+    match windows_ocr::recognize_lines(std::path::Path::new(&path), &language) {
+        Ok(lines) => {
+            println!("Recognized lines:");
+            for line in lines {
+                let words: Vec<String> = line
+                    .iter()
+                    .map(|word| format!("{}@{:.0},{:.0}", word.text, word.rect[0], word.rect[1]))
+                    .collect();
+                println!("{}", words.join(" "));
+            }
+        }
         Err(error) => {
             eprintln!("OCR failed: {error}");
             std::process::exit(1);
