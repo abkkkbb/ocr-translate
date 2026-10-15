@@ -7,7 +7,7 @@ mod volcengine;
 mod windows_ocr;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use eframe::egui;
+use eframe::egui::{self, Color32, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -53,6 +53,15 @@ impl TranslationMode {
             Self::Google => "Google 翻译（免 Key，可能限流）",
             Self::Volcengine => "火山机器翻译（AK/SK）",
             Self::Vision => "自定义视觉模型",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Tencent => "腾讯翻译",
+            Self::Google => "Google 翻译",
+            Self::Volcengine => "火山翻译",
+            Self::Vision => "视觉模型",
         }
     }
 }
@@ -175,6 +184,7 @@ struct OcrTranslateApp {
 impl OcrTranslateApp {
     fn new(ctx: &egui::Context) -> Self {
         let config_path = config_path();
+        let config_existed = config_path.exists();
         let mut config = load_config(&config_path);
         let (plaintext_secrets, undecryptable_secrets) = config.reveal_secrets();
         config.font_size = config
@@ -204,7 +214,8 @@ impl OcrTranslateApp {
             hotkey_capture_active: false,
             paste_key_down: false,
             status: format!("准备就绪。按 {shortcut} 框选屏幕。"),
-            settings_open: true,
+            // First run lands on settings; afterwards go straight to translating.
+            settings_open: !config_existed,
             show_api_key: false,
             show_volcengine_keys: false,
             ocr_languages,
@@ -494,216 +505,284 @@ impl OcrTranslateApp {
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("翻译设置");
-        ui.add_space(8.0);
-        ui.label("主题");
-        let previous_theme = self.config.theme;
+        let palette = Palette::of(self.config.theme);
+        let width = ui.available_width().min(680.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.config.theme, ThemeMode::Day, "日间");
-            ui.selectable_value(&mut self.config.theme, ThemeMode::Night, "夜间");
-        });
-        if self.config.theme != previous_theme {
-            apply_appearance(ui.ctx(), &self.config);
-        }
-        ui.add_space(8.0);
-
-        ui.label("字号大小");
-        if ui
-            .add(egui::Slider::new(&mut self.config.font_size, FONT_SIZE_RANGE).suffix(" px"))
-            .changed()
-        {
-            apply_appearance(ui.ctx(), &self.config);
-        }
-        ui.add_space(16.0);
-
-        ui.label("翻译渠道");
-        egui::ComboBox::from_id_salt("translation_mode")
-            .selected_text(self.config.mode.label())
-            .show_ui(ui, |ui| {
-                for mode in [
-                    TranslationMode::Tencent,
-                    TranslationMode::Google,
-                    TranslationMode::Volcengine,
-                    TranslationMode::Vision,
-                ] {
-                    ui.selectable_value(&mut self.config.mode, mode, mode.label());
-                }
-            });
-        ui.add_space(12.0);
-
-        if self.config.mode == TranslationMode::Vision {
-            ui.label("API URL");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.config.api_url).desired_width(f32::INFINITY),
-            );
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                ui.label("API Key");
-                ui.checkbox(&mut self.show_api_key, "显示");
-            });
-            let mut key_edit =
-                egui::TextEdit::singleline(&mut self.config.api_key).desired_width(f32::INFINITY);
-            if !self.show_api_key {
-                key_edit = key_edit.password(true);
-            }
-            ui.add(key_edit);
-            ui.add_space(8.0);
-
-            ui.label("模型");
-            ui.add(egui::TextEdit::singleline(&mut self.config.model).desired_width(f32::INFINITY));
-            ui.add_space(8.0);
-        } else {
-            if self.config.mode == TranslationMode::Volcengine {
-                let (access_key, secret_key) = volcengine_credentials(&self.config);
-                let configured = !access_key.trim().is_empty() && !secret_key.trim().is_empty();
-                ui.label(if configured {
-                    "火山凭证：已配置"
-                } else {
-                    "火山凭证：尚未配置"
-                });
-                ui.add_space(8.0);
-
+            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                ui.add_space(4.0);
+                self.draw_appearance_card(ui, &palette);
+                ui.add_space(14.0);
+                self.draw_channel_card(ui, &palette);
+                ui.add_space(14.0);
+                self.draw_shortcut_card(ui, &palette);
+                ui.add_space(18.0);
                 ui.horizontal(|ui| {
-                    ui.label("Access Key (AK)");
-                    ui.checkbox(&mut self.show_volcengine_keys, "显示密钥");
-                });
-                let access_edit =
-                    egui::TextEdit::singleline(&mut self.config.volcengine_access_key)
-                        .desired_width(f32::INFINITY)
-                        .password(!self.show_volcengine_keys);
-                ui.add(access_edit);
-                ui.add_space(8.0);
-
-                ui.label("Secret Key (SK)");
-                let secret_edit =
-                    egui::TextEdit::singleline(&mut self.config.volcengine_secret_key)
-                        .desired_width(f32::INFINITY)
-                        .password(!self.show_volcengine_keys);
-                ui.add(secret_edit);
-                ui.small("填写后点击“保存设置”。开发环境也兼容 VOLCENGINE_ACCESS_KEY / VOLCENGINE_SECRET_KEY 环境变量。");
-                ui.add_space(8.0);
-            }
-            ui.label("原文识别语言");
-            egui::ComboBox::from_id_salt("ocr_language")
-                .selected_text(if self.config.ocr_language == "auto" {
-                    "自动（系统语言）"
-                } else {
-                    &self.config.ocr_language
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.config.ocr_language,
-                        "auto".into(),
-                        "自动（系统语言）",
+                    if ui.add(primary_button(&palette, "保存设置")).clicked() {
+                        self.save_config();
+                    }
+                    ui.add_space(8.0);
+                    hint(
+                        ui,
+                        &palette,
+                        "配置保存在当前用户的应用数据目录，密钥已加密。",
                     );
-                    for language in &self.ocr_languages {
+                });
+                ui.add_space(12.0);
+            });
+        });
+    }
+
+    fn draw_appearance_card(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        card(ui, palette, |ui| {
+            section_title(
+                ui,
+                palette,
+                "外观",
+                "主题与字号会立即预览，保存后下次启动仍然生效。",
+            );
+            egui::Grid::new("appearance")
+                .num_columns(2)
+                .spacing([24.0, 14.0])
+                .show(ui, |ui| {
+                    field_label(ui, palette, "主题");
+                    if segmented(
+                        ui,
+                        palette,
+                        &mut self.config.theme,
+                        &[(ThemeMode::Day, "日间"), (ThemeMode::Night, "夜间")],
+                    ) {
+                        apply_appearance(ui.ctx(), &self.config);
+                    }
+                    ui.end_row();
+
+                    field_label(ui, palette, "字号");
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.config.font_size, FONT_SIZE_RANGE)
+                                .suffix(" px"),
+                        )
+                        .changed()
+                    {
+                        apply_appearance(ui.ctx(), &self.config);
+                    }
+                    ui.end_row();
+                });
+        });
+    }
+
+    fn draw_channel_card(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        card(ui, palette, |ui| {
+            section_title(ui, palette, "翻译", "选择翻译渠道和语言。");
+            field_label(ui, palette, "翻译渠道");
+            egui::ComboBox::from_id_salt("translation_mode")
+                .width(ui.available_width())
+                .selected_text(self.config.mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        TranslationMode::Tencent,
+                        TranslationMode::Google,
+                        TranslationMode::Volcengine,
+                        TranslationMode::Vision,
+                    ] {
+                        ui.selectable_value(&mut self.config.mode, mode, mode.label());
+                    }
+                });
+            match self.config.mode {
+                TranslationMode::Tencent | TranslationMode::Google => {
+                    hint(
+                        ui,
+                        palette,
+                        "免 Key 渠道使用第三方网页接口，可用性会随服务方变化。",
+                    );
+                }
+                TranslationMode::Volcengine => {
+                    let (access_key, secret_key) = volcengine_credentials(&self.config);
+                    let configured = !access_key.trim().is_empty() && !secret_key.trim().is_empty();
+                    hint(
+                        ui,
+                        palette,
+                        if configured {
+                            "火山凭证已配置。"
+                        } else {
+                            "火山凭证尚未配置，填写后点击“保存设置”。"
+                        },
+                    );
+                }
+                TranslationMode::Vision => {}
+            }
+            ui.add_space(14.0);
+
+            if self.config.mode == TranslationMode::Vision {
+                field_label(ui, palette, "API URL");
+                ui.add(text_field(&mut self.config.api_url).desired_width(f32::INFINITY));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    field_label(ui, palette, "API Key");
+                    ui.checkbox(&mut self.show_api_key, "显示");
+                });
+                ui.add(
+                    text_field(&mut self.config.api_key)
+                        .desired_width(f32::INFINITY)
+                        .password(!self.show_api_key),
+                );
+                ui.add_space(10.0);
+                field_label(ui, palette, "模型");
+                ui.add(text_field(&mut self.config.model).desired_width(f32::INFINITY));
+                ui.add_space(10.0);
+            } else {
+                if self.config.mode == TranslationMode::Volcengine {
+                    ui.horizontal(|ui| {
+                        field_label(ui, palette, "Access Key (AK)");
+                        ui.checkbox(&mut self.show_volcengine_keys, "显示密钥");
+                    });
+                    ui.add(
+                        text_field(&mut self.config.volcengine_access_key)
+                            .desired_width(f32::INFINITY)
+                            .password(!self.show_volcengine_keys),
+                    );
+                    ui.add_space(10.0);
+                    field_label(ui, palette, "Secret Key (SK)");
+                    ui.add(
+                        text_field(&mut self.config.volcengine_secret_key)
+                            .desired_width(f32::INFINITY)
+                            .password(!self.show_volcengine_keys),
+                    );
+                    hint(
+                        ui,
+                        palette,
+                        "开发环境也兼容 VOLCENGINE_ACCESS_KEY / VOLCENGINE_SECRET_KEY 环境变量。",
+                    );
+                    ui.add_space(10.0);
+                }
+
+                field_label(ui, palette, "原文识别语言");
+                egui::ComboBox::from_id_salt("ocr_language")
+                    .width(ui.available_width())
+                    .selected_text(if self.config.ocr_language == "auto" {
+                        "自动（系统语言）"
+                    } else {
+                        &self.config.ocr_language
+                    })
+                    .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.config.ocr_language,
-                            language.clone(),
-                            language,
+                            "auto".into(),
+                            "自动（系统语言）",
                         );
-                    }
-                });
-            if self.ocr_languages.is_empty() {
-                ui.small("未检测到 Windows OCR 语言包，请在系统语言设置中安装。");
+                        for language in &self.ocr_languages {
+                            ui.selectable_value(
+                                &mut self.config.ocr_language,
+                                language.clone(),
+                                language,
+                            );
+                        }
+                    });
+                if self.ocr_languages.is_empty() {
+                    hint(
+                        ui,
+                        palette,
+                        "未检测到 Windows OCR 语言包，请在系统语言设置中安装。",
+                    );
+                }
+                ui.add_space(10.0);
             }
-            ui.add_space(8.0);
-        }
 
-        ui.label("目标语言");
-        if self.config.mode == TranslationMode::Vision {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.config.target_language)
-                    .desired_width(f32::INFINITY),
-            );
-        } else {
-            egui::ComboBox::from_id_salt("target_language")
-                .selected_text(&self.config.target_language)
-                .show_ui(ui, |ui| {
-                    for language in TARGET_LANGUAGES {
-                        ui.selectable_value(
-                            &mut self.config.target_language,
-                            language.into(),
-                            language,
-                        );
-                    }
-                });
-            if matches!(
-                self.config.mode,
-                TranslationMode::Tencent | TranslationMode::Google
-            ) {
-                ui.small("免 Key 渠道使用第三方网页接口，可用性会随服务方变化。");
+            field_label(ui, palette, "目标语言");
+            if self.config.mode == TranslationMode::Vision {
+                ui.add(text_field(&mut self.config.target_language).desired_width(f32::INFINITY));
+            } else {
+                egui::ComboBox::from_id_salt("target_language")
+                    .width(ui.available_width())
+                    .selected_text(&self.config.target_language)
+                    .show_ui(ui, |ui| {
+                        for language in TARGET_LANGUAGES {
+                            ui.selectable_value(
+                                &mut self.config.target_language,
+                                language.into(),
+                                language,
+                            );
+                        }
+                    });
             }
-        }
-        ui.add_space(8.0);
-
-        ui.label("全局截图快捷键");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.shortcut_draft.ctrl, "Ctrl");
-            ui.checkbox(&mut self.shortcut_draft.alt, "Alt");
-            ui.checkbox(&mut self.shortcut_draft.shift, "Shift");
-            egui::ComboBox::from_id_salt("shortcut_key")
-                .selected_text(screen_clip::Hotkey::key_name(self.shortcut_draft.key))
-                .show_ui(ui, |ui| {
-                    for key in screen_clip::Hotkey::key_choices() {
-                        ui.selectable_value(
-                            &mut self.shortcut_draft.key,
-                            key,
-                            screen_clip::Hotkey::key_name(key),
-                        );
-                    }
-                });
         });
-        match (self.shortcut_draft.validate(), self.active_hotkey) {
-            (Err(error), _) => ui.small(error),
-            (Ok(()), Some(active)) if active != self.shortcut_draft => ui.small(format!(
-                "当前生效：{active}。点击“保存设置”后改为 {}。",
-                self.shortcut_draft
-            )),
-            (Ok(()), Some(_)) => ui.small("应用运行期间在任何窗口都有效。"),
-            (Ok(()), None) => ui.small("当前没有生效的全局快捷键，点击“保存设置”重试注册。"),
-        };
-        ui.add_space(14.0);
+    }
 
-        if ui.button("保存设置").clicked() {
-            self.save_config();
-        }
-        ui.add_space(8.0);
-        ui.small("配置保存在当前用户的应用数据目录中。");
+    fn draw_shortcut_card(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        card(ui, palette, |ui| {
+            section_title(
+                ui,
+                palette,
+                "全局快捷键",
+                "在任何窗口按下即可框选屏幕并翻译。",
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.shortcut_draft.ctrl, "Ctrl");
+                ui.checkbox(&mut self.shortcut_draft.alt, "Alt");
+                ui.checkbox(&mut self.shortcut_draft.shift, "Shift");
+                ui.add_space(4.0);
+                egui::ComboBox::from_id_salt("shortcut_key")
+                    .width(72.0)
+                    .selected_text(screen_clip::Hotkey::key_name(self.shortcut_draft.key))
+                    .show_ui(ui, |ui| {
+                        for key in screen_clip::Hotkey::key_choices() {
+                            ui.selectable_value(
+                                &mut self.shortcut_draft.key,
+                                key,
+                                screen_clip::Hotkey::key_name(key),
+                            );
+                        }
+                    });
+            });
+            ui.add_space(4.0);
+            match (self.shortcut_draft.validate(), self.active_hotkey) {
+                (Err(error), _) => hint(ui, palette, &error),
+                (Ok(()), Some(active)) if active != self.shortcut_draft => hint(
+                    ui,
+                    palette,
+                    &format!(
+                        "当前生效：{active}。点击“保存设置”后改为 {}。",
+                        self.shortcut_draft
+                    ),
+                ),
+                (Ok(()), Some(active)) => hint(ui, palette, &format!("当前生效：{active}")),
+                (Ok(()), None) => hint(
+                    ui,
+                    palette,
+                    "当前没有生效的全局快捷键，点击“保存设置”重试注册。",
+                ),
+            }
+        });
     }
 
     fn draw_result(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("截图翻译");
-        ui.add_space(4.0);
-        ui.label(format!(
-            "按 {} 框选屏幕，选择图片，或直接输入原文翻译。",
-            self.shortcut_label()
-        ));
-        ui.add_space(12.0);
-
+        let palette = Palette::of(self.config.theme);
         let idle = !self.busy();
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(idle, egui::Button::new("框选屏幕"))
+                .add_enabled(idle, primary_button(&palette, "框选屏幕"))
+                .on_hover_text(format!("快捷键：{}", self.shortcut_label()))
                 .clicked()
             {
                 self.start_screen_capture(ctx);
             }
-            if ui
-                .add_enabled(idle, egui::Button::new("选择截图 / 图片"))
-                .clicked()
-            {
+            if ui.add_enabled(idle, secondary_button("选择图片")).clicked() {
                 self.choose_image(ctx);
             }
             if ui
-                .add_enabled(idle, egui::Button::new("翻译原文"))
+                .add_enabled(idle, secondary_button("翻译原文"))
+                .on_hover_text("翻译原文框中输入或修改过的文字")
                 .clicked()
             {
                 self.start_text_translation(ctx);
             }
             if ui
-                .add_enabled(idle, egui::Button::new("重新翻译"))
+                .add_enabled(
+                    idle && self.selected_file.is_some(),
+                    secondary_button("重新翻译"),
+                )
+                .on_hover_text("对当前图片重新识别并翻译")
                 .clicked()
             {
                 if let Some(path) = self.selected_file.clone() {
@@ -711,20 +790,19 @@ impl OcrTranslateApp {
                 }
             }
             if let Some(path) = &self.selected_file {
-                if self.temporary_capture.as_ref() == Some(path) {
-                    ui.label("当前图片");
+                let name = if self.temporary_capture.as_ref() == Some(path) {
+                    "截图"
                 } else {
-                    ui.label(
-                        path.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("已选择图片"),
-                    );
-                }
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("已选择图片")
+                };
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("当前图片：{name}")).color(palette.muted));
             }
         });
-        ui.add_space(16.0);
+        ui.add_space(14.0);
 
-        let available = ui.available_height();
         let paste_released = ui.input(|input| {
             input.events.iter().any(|event| {
                 matches!(
@@ -739,29 +817,70 @@ impl OcrTranslateApp {
             })
         });
         let paste_keys_down = screen_clip::paste_keys_down();
+        let source_hint = format!(
+            "输入或粘贴文字，Ctrl+V 可直接粘贴图片\n也可以按 {} 框选屏幕",
+            self.shortcut_label()
+        );
         let mut source_focused = false;
+        let mut clear_source = false;
+        let mut copy_translation = false;
         ui.columns(2, |columns| {
-            columns[0].label("原文");
-            source_focused = columns[0]
-                .add_sized(
-                    [columns[0].available_width(), (available - 48.0).max(160.0)],
-                    egui::TextEdit::multiline(&mut self.result.source_text)
-                        .hint_text("输入或识别出的原文会显示在这里")
-                        .desired_rows(12),
-                )
-                .has_focus();
-            columns[1].label("译文");
-            columns[1].add_sized(
-                [columns[1].available_width(), (available - 48.0).max(160.0)],
-                egui::TextEdit::multiline(&mut self.result.translated_text)
-                    .hint_text("翻译结果会显示在这里")
-                    .desired_rows(12),
+            (source_focused, clear_source) = text_card(
+                &mut columns[0],
+                &palette,
+                "原文",
+                &mut self.result.source_text,
+                &source_hint,
+                "清空",
+            );
+            (_, copy_translation) = text_card(
+                &mut columns[1],
+                &palette,
+                "译文",
+                &mut self.result.translated_text,
+                "翻译结果会显示在这里",
+                "复制",
             );
         });
+        if clear_source {
+            self.result.source_text.clear();
+        }
+        if copy_translation {
+            ctx.copy_text(self.result.translated_text.clone());
+            self.status = "译文已复制到剪贴板。".into();
+        }
         if source_focused && ((paste_keys_down || paste_released) && !self.paste_key_down) {
             self.paste_image(ctx);
         }
         self.paste_key_down = paste_keys_down;
+    }
+
+    fn draw_status_bar(&self, ui: &mut egui::Ui, palette: &Palette) {
+        egui::Sides::new().shrink_left().show(
+            ui,
+            |ui| {
+                if self.busy() {
+                    ui.add(egui::Spinner::new().size(12.0).color(palette.accent));
+                } else {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot.center(), 3.5, palette.accent);
+                }
+                ui.add(
+                    egui::Label::new(RichText::new(&self.status).color(palette.text)).truncate(),
+                );
+            },
+            |ui| {
+                let shortcut = self
+                    .active_hotkey
+                    .map_or_else(|| "快捷键未注册".into(), |hotkey| hotkey.to_string());
+                ui.label(
+                    RichText::new(format!("{}  ·  {shortcut}", self.config.mode.short_label()))
+                        .color(palette.muted),
+                );
+            },
+        );
     }
 }
 
@@ -770,28 +889,58 @@ impl eframe::App for OcrTranslateApp {
         self.poll_hotkey(ctx);
         self.poll_screen_capture(ctx);
         self.poll_request(ctx);
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("OCR Translate");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.selectable_label(self.settings_open, "设置").clicked() {
-                        self.settings_open = true;
-                    }
-                    if ui.selectable_label(!self.settings_open, "翻译").clicked() {
-                        self.settings_open = false;
-                    }
+        let palette = Palette::of(self.config.theme);
+
+        egui::TopBottomPanel::top("top_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .inner_margin(egui::Margin::symmetric(20, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("OCR Translate")
+                            .heading()
+                            .strong()
+                            .color(palette.text),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("截图识别 · 即时翻译").color(palette.muted));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        segmented(
+                            ui,
+                            &palette,
+                            &mut self.settings_open,
+                            &[(false, "翻译"), (true, "设置")],
+                        );
+                    });
                 });
             });
-            ui.label(&self.status);
-        });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.settings_open {
-                egui::ScrollArea::vertical().show(ui, |ui| self.draw_settings(ui));
-            } else {
-                self.draw_result(ui, ctx);
-            }
-        });
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .inner_margin(egui::Margin::symmetric(20, 8)),
+            )
+            .show(ctx, |ui| self.draw_status_bar(ui, &palette));
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.background)
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .show(ctx, |ui| {
+                if self.settings_open {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| self.draw_settings(ui));
+                } else {
+                    self.draw_result(ui, ctx);
+                }
+            });
         self.hotkey.set_busy(self.busy());
     }
 }
@@ -962,11 +1111,104 @@ fn compact_error(text: &str) -> String {
     text.replace(['\r', '\n'], " ").chars().take(300).collect()
 }
 
+/// Colours shared by the custom widgets and the egui visuals for one theme.
+struct Palette {
+    background: Color32,
+    surface: Color32,
+    input: Color32,
+    hover: Color32,
+    pressed: Color32,
+    border: Color32,
+    text: Color32,
+    muted: Color32,
+    accent: Color32,
+    on_accent: Color32,
+}
+
+impl Palette {
+    fn of(theme: ThemeMode) -> Self {
+        match theme {
+            ThemeMode::Day => Self {
+                background: Color32::from_rgb(0xF3, 0xF4, 0xF7),
+                surface: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+                input: Color32::from_rgb(0xF6, 0xF7, 0xF9),
+                hover: Color32::from_rgb(0xEC, 0xEE, 0xF2),
+                pressed: Color32::from_rgb(0xE2, 0xE5, 0xEB),
+                border: Color32::from_rgb(0xE1, 0xE4, 0xEA),
+                text: Color32::from_rgb(0x1F, 0x23, 0x29),
+                muted: Color32::from_rgb(0x6B, 0x72, 0x80),
+                accent: Color32::from_rgb(0x3B, 0x6E, 0xF5),
+                on_accent: Color32::WHITE,
+            },
+            ThemeMode::Night => Self {
+                background: Color32::from_rgb(0x14, 0x16, 0x1B),
+                surface: Color32::from_rgb(0x1C, 0x1F, 0x26),
+                input: Color32::from_rgb(0x23, 0x27, 0x2F),
+                hover: Color32::from_rgb(0x2B, 0x30, 0x3A),
+                pressed: Color32::from_rgb(0x33, 0x39, 0x45),
+                border: Color32::from_rgb(0x2D, 0x32, 0x3C),
+                text: Color32::from_rgb(0xE6, 0xE8, 0xEC),
+                muted: Color32::from_rgb(0x8B, 0x93, 0xA1),
+                accent: Color32::from_rgb(0x5B, 0x8C, 0xFF),
+                on_accent: Color32::WHITE,
+            },
+        }
+    }
+}
+
 fn apply_appearance(ctx: &egui::Context, config: &AppConfig) {
-    ctx.set_visuals(match config.theme {
+    let palette = Palette::of(config.theme);
+    let mut visuals = match config.theme {
         ThemeMode::Day => egui::Visuals::light(),
         ThemeMode::Night => egui::Visuals::dark(),
-    });
+    };
+    visuals.panel_fill = palette.background;
+    visuals.window_fill = palette.surface;
+    visuals.window_stroke = Stroke::new(1.0_f32, palette.border);
+    visuals.extreme_bg_color = palette.input;
+    visuals.text_edit_bg_color = Some(palette.input);
+    visuals.faint_bg_color = palette.input;
+    visuals.hyperlink_color = palette.accent;
+    visuals.selection.bg_fill = palette.accent.gamma_multiply(0.45);
+    visuals.selection.stroke = Stroke::new(1.0_f32, palette.accent);
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
+    let shadow = egui::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: Color32::from_black_alpha(match config.theme {
+            ThemeMode::Day => 30,
+            ThemeMode::Night => 90,
+        }),
+    };
+    visuals.window_shadow = shadow;
+    visuals.popup_shadow = shadow;
+
+    let widgets = &mut visuals.widgets;
+    widgets.noninteractive.bg_fill = palette.surface;
+    widgets.noninteractive.weak_bg_fill = palette.surface;
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, palette.border);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, palette.text);
+    widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
+    for (state, fill, stroke) in [
+        (&mut widgets.inactive, palette.input, palette.border),
+        (
+            &mut widgets.hovered,
+            palette.hover,
+            palette.accent.gamma_multiply(0.6),
+        ),
+        (&mut widgets.active, palette.pressed, palette.accent),
+        (&mut widgets.open, palette.input, palette.border),
+    ] {
+        state.bg_fill = fill;
+        state.weak_bg_fill = fill;
+        state.bg_stroke = Stroke::new(1.0_f32, stroke);
+        state.fg_stroke = Stroke::new(1.0_f32, palette.text);
+        state.corner_radius = egui::CornerRadius::same(8);
+        state.expansion = 0.0;
+    }
+    ctx.set_visuals(visuals);
 
     let size = config
         .font_size
@@ -977,14 +1219,163 @@ fn apply_appearance(ctx: &egui::Context, config: &AppConfig) {
         (egui::TextStyle::Button, size),
         (egui::TextStyle::Monospace, size),
         (egui::TextStyle::Heading, size + 5.0),
-        (egui::TextStyle::Small, (size - 4.0).max(9.0)),
+        (egui::TextStyle::Small, (size - 2.0).max(10.0)),
     ] {
         if let Some(font) = style.text_styles.get_mut(&text_style) {
             font.size = font_size;
         }
     }
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 6.0);
+    style.spacing.interact_size.y = size + 16.0;
+    style.spacing.slider_width = 260.0;
+    style.visuals.slider_trailing_fill = true;
     ctx.set_style(style);
     ctx.request_repaint();
+}
+
+fn card<R>(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    egui::Frame::new()
+        .fill(palette.surface)
+        .stroke(Stroke::new(1.0_f32, palette.border))
+        .corner_radius(12u8)
+        .inner_margin(18i8)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add_contents(ui)
+        })
+}
+
+fn section_title(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
+    let size = ui.style().text_styles[&egui::TextStyle::Body].size + 3.0;
+    ui.label(RichText::new(title).size(size).strong().color(palette.text));
+    hint(ui, palette, subtitle);
+    ui.add_space(10.0);
+}
+
+fn field_label(ui: &mut egui::Ui, palette: &Palette, text: &str) {
+    ui.label(RichText::new(text).color(palette.muted));
+}
+
+fn hint(ui: &mut egui::Ui, palette: &Palette, text: &str) {
+    ui.label(RichText::new(text).small().color(palette.muted));
+}
+
+fn primary_button(palette: &Palette, text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).strong().color(palette.on_accent))
+        .fill(palette.accent)
+        .stroke(Stroke::NONE)
+}
+
+fn text_field(text: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).margin(egui::vec2(10.0, 7.0))
+}
+
+fn secondary_button(text: &str) -> egui::Button<'static> {
+    egui::Button::new(text.to_owned())
+}
+
+/// A pill-shaped switch between a few options. Returns true when the value changed.
+fn segmented<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    value: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    let mut changed = false;
+    egui::Frame::new()
+        .fill(palette.input)
+        .corner_radius(9u8)
+        .inner_margin(3i8)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                let mut ordered: Vec<&(T, &str)> = options.iter().collect();
+                // In a right-to-left layout, add in reverse so the options still read left to right.
+                if ui.layout().prefer_right_to_left() {
+                    ordered.reverse();
+                }
+                for (option, label) in ordered {
+                    let selected = *value == *option;
+                    let text = RichText::new(*label).color(if selected {
+                        palette.on_accent
+                    } else {
+                        palette.muted
+                    });
+                    let button = egui::Button::new(text)
+                        .fill(if selected {
+                            palette.accent
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .stroke(Stroke::NONE)
+                        .corner_radius(7u8)
+                        .min_size(egui::vec2(64.0, 0.0));
+                    if ui.add(button).clicked() && !selected {
+                        *value = *option;
+                        changed = true;
+                    }
+                }
+            });
+        });
+    changed
+}
+
+/// A titled card with a borderless editor filling the rest of the column.
+/// Returns whether the editor has focus and whether the header action was clicked.
+fn text_card(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    title: &str,
+    text: &mut String,
+    hint_text: &str,
+    action: &str,
+) -> (bool, bool) {
+    let mut action_clicked = false;
+    let focused = card(ui, palette, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).strong().color(palette.text));
+            let count = text.chars().filter(|c| !c.is_whitespace()).count();
+            if count > 0 {
+                ui.label(
+                    RichText::new(format!("{count} 字"))
+                        .small()
+                        .color(palette.muted),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                action_clicked = ui
+                    .add_enabled(
+                        !text.is_empty(),
+                        egui::Button::new(RichText::new(action).color(palette.accent)).frame(false),
+                    )
+                    .clicked();
+            });
+        });
+        ui.add_space(4.0);
+        let height = ui.available_height().max(140.0);
+        egui::ScrollArea::vertical()
+            .id_salt(title)
+            .auto_shrink(false)
+            .max_height(height)
+            .show(ui, |ui| {
+                ui.add_sized(
+                    [ui.available_width(), height],
+                    egui::TextEdit::multiline(text)
+                        .frame(false)
+                        .hint_text(hint_text)
+                        .desired_width(f32::INFINITY),
+                )
+                .has_focus()
+            })
+            .inner
+    })
+    .inner;
+    (focused, action_clicked)
 }
 
 fn install_chinese_font(ctx: &egui::Context) {
