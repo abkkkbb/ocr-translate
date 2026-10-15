@@ -30,6 +30,10 @@ For a packaged desktop application, the settings page plus the per-user JSON fil
 
 The configured API receives the selected image. Use a vision-capable model and an endpoint compatible with OpenAI Chat Completions image input. The model is asked to return JSON with `source_text` and `translated_text` fields.
 
+## Distribution
+
+`.cargo/config.toml` links the Visual C++ runtime statically, so `target/release/ocr-translate.exe` runs on its own without the VC++ redistributable. It still needs Windows 10 or 11 with an OCR language pack for the source language, the built-in Snipping Tool for the screen-snip shortcut, and an OpenGL-capable display driver.
+
 ## Run
 
 ```powershell
