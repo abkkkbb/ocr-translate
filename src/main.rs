@@ -2063,28 +2063,39 @@ fn text_card(
     (focused, action_clicked)
 }
 
-fn install_chinese_font(ctx: &egui::Context) {
+/// System fonts tried after egui's built-in Latin font, in order. Each entry is a list of
+/// alternatives; the first one present is used. Microsoft YaHei has no Hangul, so Malgun Gothic
+/// follows it to cover Korean.
+const FALLBACK_FONTS: [(&str, &[&str]); 2] = [
+    ("Windows CJK", &["msyh.ttc", "Deng.ttf", "simhei.ttf"]),
+    ("Windows Korean", &["malgun.ttf", "gulim.ttc"]),
+];
+
+fn install_system_fonts(ctx: &egui::Context) {
     let font_dir = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
         .join("Fonts");
-    let font_bytes = ["msyh.ttc", "Deng.ttf", "simhei.ttf"]
-        .iter()
-        .find_map(|name| fs::read(font_dir.join(name)).ok());
-
-    if let Some(bytes) = font_bytes {
-        let mut fonts = egui::FontDefinitions::default();
-        let name = "Windows Chinese".to_owned();
+    let mut fonts = egui::FontDefinitions::default();
+    let mut position = 1;
+    for (name, files) in FALLBACK_FONTS {
+        let Some(bytes) = files
+            .iter()
+            .find_map(|file| fs::read(font_dir.join(file)).ok())
+        else {
+            continue;
+        };
         fonts
             .font_data
-            .insert(name.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+            .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(names) = fonts.families.get_mut(&family) {
-                names.insert(1, name.clone());
+                names.insert(position.min(names.len()), name.to_owned());
             }
         }
-        ctx.set_fonts(fonts);
+        position += 1;
     }
+    ctx.set_fonts(fonts);
 }
 
 fn main() -> eframe::Result {
@@ -2098,7 +2109,7 @@ fn main() -> eframe::Result {
         "OCR Translate",
         options,
         Box::new(|cc| {
-            install_chinese_font(&cc.egui_ctx);
+            install_system_fonts(&cc.egui_ctx);
             Ok(Box::new(OcrTranslateApp::new(&cc.egui_ctx)))
         }),
     )
