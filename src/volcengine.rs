@@ -5,10 +5,33 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
-const HOST: &str = "translate.volcengineapi.com";
 const REGION: &str = "cn-beijing";
-const SERVICE: &str = "translate";
-const QUERY: &str = "Action=TranslateText&Version=2025-03-01";
+
+/// A Volcengine OpenAPI endpoint: host, signing service name and action query.
+struct Endpoint {
+    host: &'static str,
+    service: &'static str,
+    query: &'static str,
+}
+
+const TRANSLATE: Endpoint = Endpoint {
+    host: "translate.volcengineapi.com",
+    service: "translate",
+    query: "Action=TranslateText&Version=2025-03-01",
+};
+const BILL_DETAIL: Endpoint = Endpoint {
+    host: "billing.volcengineapi.com",
+    service: "billing",
+    query: "Action=ListBillDetail&Version=2022-01-01",
+};
+const BALANCE: Endpoint = Endpoint {
+    host: "billing.volcengineapi.com",
+    service: "billing",
+    query: "Action=QueryBalanceAcct&Version=2022-01-01",
+};
+
+/// Text translation is free for the first two million characters each month.
+pub const FREE_CHARS_PER_MONTH: f64 = 2_000_000.0;
 
 /// Texts per request; the API caps the list length.
 const BATCH_SIZE: usize = 16;
@@ -56,54 +79,157 @@ fn request(
     secret_key: &str,
 ) -> Result<Vec<String>, String> {
     let body = serde_json::json!({ "TargetLanguage": target, "TextList": texts });
-    let body =
-        serde_json::to_string(&body).map_err(|error| format!("创建火山请求失败：{error}"))?;
+    parse_response(&post(
+        &TRANSLATE,
+        &body,
+        access_key,
+        secret_key,
+        "火山翻译",
+    )?)
+}
+
+/// Sends a signed POST and returns the response body. `label` names the call in errors.
+fn post(
+    endpoint: &Endpoint,
+    body: &Value,
+    access_key: &str,
+    secret_key: &str,
+    label: &str,
+) -> Result<String, String> {
+    let body = serde_json::to_string(body).map_err(|error| format!("创建火山请求失败：{error}"))?;
     let date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let (body_hash, authorization) = sign(access_key, secret_key, &date, &body);
+    let (body_hash, authorization) = sign(endpoint, access_key, secret_key, &date, &body);
     let client = crate::net::client_builder()?
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|error| format!("创建网络客户端失败：{error}"))?;
     let response = client
-        .post(format!("https://{HOST}/?{QUERY}"))
-        .header("Host", HOST)
+        .post(format!("https://{}/?{}", endpoint.host, endpoint.query))
+        .header("Host", endpoint.host)
         .header("Content-Type", "application/json")
         .header("X-Date", date)
         .header("X-Content-Sha256", body_hash)
         .header("Authorization", authorization)
         .body(body)
         .send()
-        .map_err(|error| format!("火山翻译请求失败：{error}"))?;
+        .map_err(|error| format!("{label}请求失败：{error}"))?;
     let status = response.status();
     let body = response
         .text()
-        .map_err(|error| format!("读取火山翻译响应失败：{error}"))?;
+        .map_err(|error| format!("读取{label}响应失败：{error}"))?;
     if !status.is_success() {
-        return Err(format!(
-            "火山翻译返回 {status}：{}",
-            super::compact_error(&body)
-        ));
+        let message = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value["ResponseMetadata"]["Error"]["Message"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| super::compact_error(&body));
+        return Err(format!("{label}返回 {status}：{message}"));
     }
-    parse_response(&body)
+    Ok(body)
 }
 
-fn sign(ak: &str, sk: &str, timestamp: &str, body: &str) -> (String, String) {
+/// This month's text-translation usage and the account balance.
+#[derive(Clone, Debug)]
+pub struct Usage {
+    pub used_chars: f64,
+    pub balance: String,
+    pub currency: String,
+}
+
+/// Bill details record free-tier usage as zero-cost rows; they lag real usage by hours.
+pub fn query_usage(access_key: &str, secret_key: &str) -> Result<Usage, String> {
+    const LABEL: &str = "火山费用查询";
+    // Bill periods follow Beijing time.
+    let period = (Utc::now() + chrono::Duration::hours(8))
+        .format("%Y-%m")
+        .to_string();
+    let mut used_chars = 0.0;
+    let mut offset = 0;
+    loop {
+        let body = serde_json::json!({
+            "BillPeriod": period,
+            "Limit": 100,
+            "Offset": offset,
+            "NeedRecordNum": 1,
+        });
+        let response = post(&BILL_DETAIL, &body, access_key, secret_key, LABEL)?;
+        let (rows, chars, total) = parse_bill_detail(&response)?;
+        used_chars += chars;
+        offset += rows;
+        if rows == 0 || offset >= total {
+            break;
+        }
+    }
+    let response = post(
+        &BALANCE,
+        &serde_json::json!({}),
+        access_key,
+        secret_key,
+        LABEL,
+    )?;
+    let balance: Value =
+        serde_json::from_str(&response).map_err(|error| format!("余额响应无效：{error}"))?;
+    let result = &balance["Result"];
+    Ok(Usage {
+        used_chars,
+        balance: result["AvailableBalance"]
+            .as_str()
+            .unwrap_or("0")
+            .to_owned(),
+        currency: result["Currency"].as_str().unwrap_or("CNY").to_owned(),
+    })
+}
+
+/// Returns the row count, the text-translation characters in those rows, and the total row count.
+fn parse_bill_detail(body: &str) -> Result<(usize, f64, usize), String> {
+    let response: Value =
+        serde_json::from_str(body).map_err(|error| format!("账单响应无效：{error}"))?;
+    if let Some(error) = response["ResponseMetadata"]["Error"]["Message"].as_str() {
+        return Err(format!("火山费用查询失败：{error}"));
+    }
+    let result = &response["Result"];
+    let rows = result["List"].as_array().cloned().unwrap_or_default();
+    let number = |value: &Value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    };
+    let chars = rows
+        .iter()
+        .filter(|row| row["ProductZh"].as_str() == Some("机器翻译"))
+        .filter(|row| row["Unit"].as_str() == Some("百万字符"))
+        .filter_map(|row| number(&row["Count"]))
+        .sum::<f64>()
+        * 1_000_000.0;
+    let total = number(&result["Total"]).map_or(rows.len(), |total| total as usize);
+    Ok((rows.len(), chars, total))
+}
+
+fn sign(endpoint: &Endpoint, ak: &str, sk: &str, timestamp: &str, body: &str) -> (String, String) {
+    let Endpoint {
+        host,
+        service,
+        query,
+    } = endpoint;
     let date = &timestamp[..8];
     let body_hash = hex::encode(Sha256::digest(body.as_bytes()));
     let headers = format!(
-        "content-type:application/json\nhost:{HOST}\nx-content-sha256:{body_hash}\nx-date:{timestamp}\n"
+        "content-type:application/json\nhost:{host}\nx-content-sha256:{body_hash}\nx-date:{timestamp}\n"
     );
     let signed_headers = "content-type;host;x-content-sha256;x-date";
-    let canonical = format!("POST\n/\n{QUERY}\n{headers}\n{signed_headers}\n{body_hash}");
-    let scope = format!("{date}/{REGION}/{SERVICE}/request");
+    let canonical = format!("POST\n/\n{query}\n{headers}\n{signed_headers}\n{body_hash}");
+    let scope = format!("{date}/{REGION}/{service}/request");
     let to_sign = format!(
         "HMAC-SHA256\n{timestamp}\n{scope}\n{}",
         hex::encode(Sha256::digest(canonical.as_bytes()))
     );
     let key_date = mac(sk.as_bytes(), date);
     let key_region = mac(&key_date, REGION);
-    let key_service = mac(&key_region, SERVICE);
+    let key_service = mac(&key_region, service);
     let signing_key = mac(&key_service, "request");
     let signature = hex::encode(mac(&signing_key, &to_sign));
     let authorization = format!(
@@ -150,8 +276,25 @@ mod tests {
     }
 
     #[test]
+    fn sums_text_translation_usage_from_bill_rows() {
+        let body = r#"{"Result":{"Total":3,"List":[
+            {"ProductZh":"机器翻译","Unit":"百万字符","Count":"0.016207"},
+            {"ProductZh":"机器翻译","Unit":"张","Count":"5"},
+            {"ProductZh":"云服务器","Unit":"小时","Count":"2"}]}}"#;
+        let (rows, chars, total) = parse_bill_detail(body).unwrap();
+        assert_eq!((rows, total), (3, 3));
+        assert!((chars - 16_207.0).abs() < 0.5);
+    }
+
+    #[test]
     fn signs_request_without_leaking_secret() {
-        let (_, authorization) = sign("example-ak", "example-sk", "20261009T050000Z", "{}");
+        let (_, authorization) = sign(
+            &TRANSLATE,
+            "example-ak",
+            "example-sk",
+            "20261009T050000Z",
+            "{}",
+        );
         assert!(authorization.starts_with(
             "HMAC-SHA256 Credential=example-ak/20261009/cn-beijing/translate/request"
         ));

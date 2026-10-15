@@ -279,6 +279,8 @@ struct OcrTranslateApp {
     hotkey_capture_active: bool,
     paste_key_down: bool,
     popup: Option<ResultPopup>,
+    volcengine_usage: Option<Result<volcengine::Usage, String>>,
+    usage_rx: Option<Receiver<Result<volcengine::Usage, String>>>,
     status: String,
     settings_open: bool,
     show_api_key: bool,
@@ -320,6 +322,8 @@ impl OcrTranslateApp {
             hotkey_capture_active: false,
             paste_key_down: false,
             popup: None,
+            volcengine_usage: None,
+            usage_rx: None,
             status: format!("准备就绪。按 {shortcut} 框选屏幕。"),
             // First run lands on settings; afterwards go straight to translating.
             settings_open: !config_existed,
@@ -741,15 +745,12 @@ impl OcrTranslateApp {
                 TranslationMode::Volcengine => {
                     let (access_key, secret_key) = volcengine_credentials(&self.config);
                     let configured = !access_key.trim().is_empty() && !secret_key.trim().is_empty();
-                    hint(
-                        ui,
-                        palette,
-                        if configured {
-                            "火山凭证已配置。"
-                        } else {
-                            "火山凭证尚未配置，填写后点击“保存设置”。"
-                        },
-                    );
+                    if configured {
+                        ui.add_space(8.0);
+                        self.draw_volcengine_usage(ui, palette);
+                    } else {
+                        hint(ui, palette, "火山凭证尚未配置，填写后点击“保存设置”。");
+                    }
                 }
                 TranslationMode::Vision => {}
             }
@@ -848,6 +849,124 @@ impl OcrTranslateApp {
                     });
             }
         });
+    }
+
+    fn refresh_usage(&mut self, ctx: &egui::Context) {
+        if self.usage_rx.is_some() {
+            return;
+        }
+        let (access_key, secret_key) = volcengine_credentials(&self.config);
+        let (tx, rx) = mpsc::channel();
+        self.usage_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(volcengine::query_usage(&access_key, &secret_key));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_usage(&mut self, ctx: &egui::Context) {
+        let received = self.usage_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(result)) => {
+                self.usage_rx = None;
+                self.volcengine_usage = Some(result);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.usage_rx = None;
+                self.volcengine_usage = Some(Err("费用查询意外结束。".into()));
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            None => {}
+        }
+    }
+
+    /// Free-tier usage this month and the account balance, queried once when first shown.
+    fn draw_volcengine_usage(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        if self.volcengine_usage.is_none() && self.usage_rx.is_none() {
+            self.refresh_usage(ui.ctx());
+        }
+        egui::Frame::new()
+            .fill(palette.input)
+            .corner_radius(8u8)
+            .inner_margin(12i8)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("本月免费额度").strong().color(palette.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.usage_rx.is_some() {
+                            ui.add(egui::Spinner::new().size(12.0).color(palette.accent));
+                        } else if ui
+                            .add(
+                                egui::Button::new(RichText::new("刷新").color(palette.accent))
+                                    .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.refresh_usage(ui.ctx());
+                        }
+                    });
+                });
+                match &self.volcengine_usage {
+                    None => hint(ui, palette, "正在查询…"),
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).small().color(palette.danger));
+                        hint(ui, palette, "查询用量需要该 AK 拥有费用中心的读取权限。");
+                    }
+                    Some(Ok(usage)) => {
+                        let total = volcengine::FREE_CHARS_PER_MONTH;
+                        let fraction = (usage.used_chars / total).clamp(0.0, 1.0) as f32;
+                        let remaining = (total - usage.used_chars).max(0.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "已用 {} / {} 字符，剩余 {}",
+                                format_chars(usage.used_chars),
+                                format_chars(total),
+                                format_chars(remaining)
+                            ))
+                            .color(palette.text),
+                        );
+                        let color = if fraction >= 0.9 {
+                            palette.danger
+                        } else {
+                            palette.accent
+                        };
+                        // Drawn by hand: the built-in bar's track matches this panel's fill.
+                        let (track, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 6.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(track, 3.0, palette.border);
+                        let mut filled = track;
+                        filled.set_width((track.width() * fraction).max(6.0));
+                        ui.painter().rect_filled(filled, 3.0, color);
+                        if usage.used_chars > total {
+                            ui.label(
+                                RichText::new("免费额度已用完，超出部分按量从余额扣费。")
+                                    .small()
+                                    .color(palette.danger),
+                            );
+                        }
+                        let currency = if usage.currency == "CNY" {
+                            "元"
+                        } else {
+                            usage.currency.as_str()
+                        };
+                        ui.label(
+                            RichText::new(format!("账户可用余额：{} {currency}", usage.balance))
+                                .color(palette.text),
+                        );
+                        hint(
+                            ui,
+                            palette,
+                            "数据来自火山账单，可能延迟数小时；按整个账号统计。",
+                        );
+                    }
+                }
+            });
     }
 
     fn draw_proxy_card(&mut self, ui: &mut egui::Ui, palette: &Palette) {
@@ -1308,6 +1427,7 @@ impl eframe::App for OcrTranslateApp {
         self.poll_hotkey(ctx);
         self.poll_screen_capture(ctx);
         self.poll_request(ctx);
+        self.poll_usage(ctx);
         let palette = Palette::of(self.config.theme);
 
         egui::TopBottomPanel::top("top_bar")
@@ -1785,6 +1905,20 @@ fn paint_translated_capture(
     }
 }
 
+/// `16207` → "1.6 万", `2000000` → "200 万", small numbers as they are.
+fn format_chars(chars: f64) -> String {
+    if chars >= 10_000.0 {
+        let wan = chars / 10_000.0;
+        if (wan - wan.round()).abs() < 0.05 {
+            format!("{} 万", wan.round())
+        } else {
+            format!("{wan:.1} 万")
+        }
+    } else {
+        format!("{}", chars.round())
+    }
+}
+
 fn card<R>(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -2052,6 +2186,14 @@ mod tests {
         let mut config: AppConfig = serde_json::from_str(r#"{"api_key":"dpapi:AAAA"}"#).unwrap();
         assert_eq!(config.reveal_secrets(), (false, true));
         assert!(config.api_key.is_empty());
+    }
+
+    #[test]
+    fn formats_character_counts_in_wan() {
+        assert_eq!(format_chars(16_207.0), "1.6 万");
+        assert_eq!(format_chars(2_000_000.0), "200 万");
+        assert_eq!(format_chars(1_983_793.0), "198.4 万");
+        assert_eq!(format_chars(820.0), "820");
     }
 
     fn popup_at(anchor: [i32; 2]) -> ResultPopup {
