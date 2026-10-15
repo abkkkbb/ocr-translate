@@ -19,6 +19,7 @@ A small Windows desktop prototype for recognizing text in an image and showing t
 - Change the global shortcut in settings: Ctrl and/or Alt, optionally Shift, plus a letter, digit, or F1–F12. Pressing it while a capture or translation is still running shows a notice instead of interrupting that work.
 - Captures left in the temp folder by a killed process are removed on the next launch once they are more than a day old.
 - Reject images larger than 20 MB and stop requests after two minutes.
+- Choose a network proxy in settings: follow the Windows system proxy (default, which picks up tools such as Clash in system-proxy mode), connect directly, or use a custom `http://` or `socks5://` address. All translation channels use it.
 
 Windows' `Win+Shift+S` screen snip shortcut and automatic clipboard copy must be available. Closing the app unregisters the shortcut when the process exits; this version does not yet have a system tray.
 

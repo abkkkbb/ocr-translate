@@ -4,7 +4,7 @@ use std::time::Duration;
 
 pub fn translate(text: &str, target: &str, mode: TranslationMode) -> Result<String, String> {
     let language = target_code(target, mode)?;
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::net::client_builder()?
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")

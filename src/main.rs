@@ -2,6 +2,7 @@
 
 mod free_translate;
 mod layout;
+mod net;
 mod screen_clip;
 mod secret_store;
 mod volcengine;
@@ -88,6 +89,8 @@ struct AppConfig {
     model: String,
     target_language: String,
     shortcut: String,
+    proxy_mode: net::ProxyMode,
+    proxy_url: String,
     volcengine_access_key: String,
     volcengine_secret_key: String,
 }
@@ -104,6 +107,8 @@ impl Default for AppConfig {
             model: "gpt-4o-mini".into(),
             target_language: "简体中文".into(),
             shortcut: "Ctrl+Shift+T".into(),
+            proxy_mode: net::ProxyMode::System,
+            proxy_url: "http://127.0.0.1:7890".into(),
             volcengine_access_key: String::new(),
             volcengine_secret_key: String::new(),
         }
@@ -111,6 +116,13 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    fn proxy(&self) -> net::ProxySetting {
+        net::ProxySetting {
+            mode: self.proxy_mode,
+            url: self.proxy_url.trim().to_owned(),
+        }
+    }
+
     fn secrets_mut(&mut self) -> [&mut String; 3] {
         [
             &mut self.api_key,
@@ -286,6 +298,7 @@ impl OcrTranslateApp {
         let shortcut = screen_clip::Hotkey::parse(&config.shortcut).unwrap_or_default();
         config.shortcut = shortcut.to_string();
         apply_appearance(ctx, &config);
+        net::set_proxy(config.proxy());
         thread::spawn(screen_clip::remove_stale_captures);
         let ocr_languages = windows_ocr::available_languages();
         if config.ocr_language != "auto"
@@ -351,6 +364,13 @@ impl OcrTranslateApp {
             self.status = error;
             return;
         }
+        if self.config.proxy_mode == net::ProxyMode::Custom {
+            if let Err(error) = net::validate_proxy_url(&self.config.proxy_url) {
+                self.status = error;
+                return;
+            }
+        }
+        net::set_proxy(self.config.proxy());
         self.config.shortcut = self.shortcut_draft.to_string();
         self.status = match self.write_config() {
             Ok(()) => "设置已保存。".into(),
@@ -636,6 +656,8 @@ impl OcrTranslateApp {
                 self.draw_channel_card(ui, &palette);
                 ui.add_space(14.0);
                 self.draw_shortcut_card(ui, &palette);
+                ui.add_space(14.0);
+                self.draw_proxy_card(ui, &palette);
                 ui.add_space(18.0);
                 ui.horizontal(|ui| {
                     if ui.add(primary_button(&palette, "保存设置")).clicked() {
@@ -824,6 +846,46 @@ impl OcrTranslateApp {
                             );
                         }
                     });
+            }
+        });
+    }
+
+    fn draw_proxy_card(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        card(ui, palette, |ui| {
+            section_title(ui, palette, "网络代理", "翻译请求使用的代理，保存后生效。");
+            segmented(
+                ui,
+                palette,
+                &mut self.config.proxy_mode,
+                &[
+                    (net::ProxyMode::System, "跟随系统"),
+                    (net::ProxyMode::None, "不使用"),
+                    (net::ProxyMode::Custom, "自定义"),
+                ],
+            );
+            ui.add_space(4.0);
+            match self.config.proxy_mode {
+                net::ProxyMode::System => hint(
+                    ui,
+                    palette,
+                    "使用 Windows 设置中的代理；Clash 等工具开启“系统代理”后会自动生效。",
+                ),
+                net::ProxyMode::None => hint(ui, palette, "所有翻译请求直接连接，不经过代理。"),
+                net::ProxyMode::Custom => {
+                    ui.add_space(6.0);
+                    field_label(ui, palette, "代理地址");
+                    ui.add(text_field(&mut self.config.proxy_url).desired_width(f32::INFINITY));
+                    match net::validate_proxy_url(&self.config.proxy_url) {
+                        Ok(()) => hint(
+                            ui,
+                            palette,
+                            "支持 http:// 和 socks5://，例如 http://127.0.0.1:7890。",
+                        ),
+                        Err(error) => {
+                            ui.label(RichText::new(error).small().color(palette.danger));
+                        }
+                    }
+                }
             }
         });
     }
@@ -1470,7 +1532,7 @@ fn chat_completion(config: &AppConfig, content: Value) -> Result<TranslationResu
             "content": content
         }]
     });
-    let client = reqwest::blocking::Client::builder()
+    let client = net::client_builder()?
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(120))
         .build()

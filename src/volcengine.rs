@@ -60,7 +60,7 @@ fn request(
         serde_json::to_string(&body).map_err(|error| format!("创建火山请求失败：{error}"))?;
     let date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let (body_hash, authorization) = sign(access_key, secret_key, &date, &body);
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::net::client_builder()?
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60))
         .build()
