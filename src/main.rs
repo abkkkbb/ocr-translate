@@ -18,6 +18,7 @@ use std::{
         Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 const CONFIG_FILE: &str = "config.json";
@@ -149,6 +150,86 @@ impl AppConfig {
     }
 }
 
+const POPUP_WIDTH: f32 = 380.0;
+const POPUP_MAX_HEIGHT: f32 = 420.0;
+const POPUP_MARGIN: i8 = 14;
+
+/// The floating result window shown next to a hotkey screen capture.
+struct ResultPopup {
+    /// Where the selection ended and the work area of that monitor, in physical pixels.
+    anchor: [i32; 2],
+    work_area: [i32; 4],
+    opened_at: Instant,
+    pinned: bool,
+    show_source: bool,
+    copied: bool,
+    /// Physical rectangle last requested for the window, to tell clicks inside from outside.
+    placed: Option<egui::Rect>,
+    height: f32,
+    escape_was_down: bool,
+    click_was_down: bool,
+}
+
+impl ResultPopup {
+    fn at_cursor() -> Self {
+        let anchor = screen_clip::cursor_position();
+        Self {
+            anchor,
+            work_area: screen_clip::work_area_at(anchor),
+            opened_at: Instant::now(),
+            pinned: false,
+            show_source: false,
+            copied: false,
+            placed: None,
+            height: 120.0,
+            escape_was_down: screen_clip::escape_down(),
+            click_was_down: screen_clip::mouse_button_down(),
+        }
+    }
+
+    /// Top-left corner for a window of `size` physical pixels: below and right of the anchor,
+    /// flipped to the other side when it would leave the monitor's work area.
+    fn place(&self, size: egui::Vec2) -> egui::Pos2 {
+        const GAP: f32 = 16.0;
+        let [left, top, right, bottom] = self.work_area.map(|value| value as f32);
+        let [x, y] = self.anchor.map(|value| value as f32);
+        let mut corner = egui::pos2(x + GAP, y + GAP);
+        if corner.x + size.x > right {
+            corner.x = x - GAP - size.x;
+        }
+        if corner.y + size.y > bottom {
+            corner.y = y - GAP - size.y;
+        }
+        egui::pos2(
+            corner.x.clamp(left, (right - size.x).max(left)),
+            corner.y.clamp(top, (bottom - size.y).max(top)),
+        )
+    }
+
+    /// Esc, or a click outside the window once the snip's own mouse release has passed, closes
+    /// an unpinned popup. Polled globally because the popup does not take keyboard focus.
+    fn dismissed(&mut self) -> bool {
+        let escape = screen_clip::escape_down();
+        let click = screen_clip::mouse_button_down();
+        let escape_pressed = escape && !self.escape_was_down;
+        let click_pressed = click && !self.click_was_down;
+        self.escape_was_down = escape;
+        self.click_was_down = click;
+        if self.pinned {
+            return false;
+        }
+        if escape_pressed {
+            return true;
+        }
+        if click_pressed && self.opened_at.elapsed() > Duration::from_millis(400) {
+            let [x, y] = screen_clip::cursor_position();
+            let cursor = egui::pos2(x as f32, y as f32);
+            return !self.placed.is_some_and(|rect| rect.contains(cursor));
+        }
+        false
+    }
+}
+
 #[derive(Default, Clone)]
 struct TranslationResult {
     source_text: String,
@@ -174,6 +255,7 @@ struct OcrTranslateApp {
     shortcut_draft: screen_clip::Hotkey,
     hotkey_capture_active: bool,
     paste_key_down: bool,
+    popup: Option<ResultPopup>,
     status: String,
     settings_open: bool,
     show_api_key: bool,
@@ -213,6 +295,7 @@ impl OcrTranslateApp {
             shortcut_draft: shortcut,
             hotkey_capture_active: false,
             paste_key_down: false,
+            popup: None,
             status: format!("准备就绪。按 {shortcut} 框选屏幕。"),
             // First run lands on settings; afterwards go straight to translating.
             settings_open: !config_existed,
@@ -303,7 +386,7 @@ impl OcrTranslateApp {
         match received {
             Some(Ok(Ok(path))) => {
                 self.capture_rx = None;
-                self.accept_capture(path, ctx);
+                self.accept_capture(path, true, ctx);
             }
             Some(Ok(Err(error))) => {
                 self.capture_rx = None;
@@ -334,17 +417,26 @@ impl OcrTranslateApp {
                 }
                 screen_clip::HotkeyEvent::Busy => {
                     self.status = "上一项截图或翻译还在进行，请完成后再按快捷键。".into();
+                    if self.popup.is_none() {
+                        self.popup = Some(ResultPopup::at_cursor());
+                    }
                 }
                 screen_clip::HotkeyEvent::Started => {
                     self.hotkey_capture_active = true;
+                    self.popup = None;
                     self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
                 }
                 screen_clip::HotkeyEvent::Captured(Ok(path)) => {
                     self.hotkey_capture_active = false;
-                    self.accept_capture(path, ctx);
+                    // The selection ends where the mouse was released, so open the popup there.
+                    self.popup = Some(ResultPopup::at_cursor());
+                    self.accept_capture(path, false, ctx);
                 }
                 screen_clip::HotkeyEvent::Captured(Err(error)) => {
                     self.hotkey_capture_active = false;
+                    if error != screen_clip::CANCELLED {
+                        self.popup = Some(ResultPopup::at_cursor());
+                    }
                     self.status = error;
                 }
                 screen_clip::HotkeyEvent::Failed { message, active } => {
@@ -364,14 +456,17 @@ impl OcrTranslateApp {
         }
     }
 
-    fn accept_capture(&mut self, path: PathBuf, ctx: &egui::Context) {
+    /// Hotkey captures leave the main window alone and show their result in the popup.
+    fn accept_capture(&mut self, path: PathBuf, reveal_main_window: bool, ctx: &egui::Context) {
         if let Some(previous) = self.temporary_capture.replace(path.clone()) {
             let _ = fs::remove_file(previous);
         }
         self.selected_file = Some(path.clone());
         self.settings_open = false;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if reveal_main_window {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.start_translation(path, ctx);
     }
 
@@ -380,7 +475,7 @@ impl OcrTranslateApp {
             return;
         }
         match screen_clip::paste_clipboard_image() {
-            Ok(Some(path)) => self.accept_capture(path, ctx),
+            Ok(Some(path)) => self.accept_capture(path, true, ctx),
             Ok(None) => {}
             Err(error) => self.status = error,
         }
@@ -855,6 +950,181 @@ impl OcrTranslateApp {
         self.paste_key_down = paste_keys_down;
     }
 
+    fn show_popup(&mut self, ctx: &egui::Context) {
+        let Some(mut popup) = self.popup.take() else {
+            return;
+        };
+        if popup.dismissed() {
+            // Not showing the viewport this frame closes its window.
+            ctx.request_repaint();
+            return;
+        }
+        let palette = Palette::of(self.config.theme);
+        let root_scale = ctx.pixels_per_point();
+        let initial = popup.place(egui::vec2(POPUP_WIDTH, popup.height) * root_scale);
+        let builder = egui::ViewportBuilder::default()
+            .with_title("OCR Translate 译文")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_active(false)
+            .with_inner_size([POPUP_WIDTH, popup.height])
+            .with_position([initial.x / root_scale, initial.y / root_scale]);
+        let mut close = false;
+        let mut open_main_window = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("result_popup"),
+            builder,
+            |ctx, _| {
+                let content_height = egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(palette.surface)
+                            .stroke(Stroke::new(1.0_f32, palette.border))
+                            .inner_margin(POPUP_MARGIN),
+                    )
+                    .show(ctx, |ui| {
+                        ui.scope(|ui| {
+                            self.draw_popup(
+                                ui,
+                                &palette,
+                                &mut popup,
+                                &mut close,
+                                &mut open_main_window,
+                            )
+                        })
+                        .response
+                        .rect
+                        .height()
+                    })
+                    .inner;
+
+                // Fit the window to its content and keep it inside the monitor's work area.
+                let height =
+                    (content_height + 2.0 * f32::from(POPUP_MARGIN)).clamp(80.0, POPUP_MAX_HEIGHT);
+                let scale = ctx.pixels_per_point();
+                let size = egui::vec2(POPUP_WIDTH, height) * scale;
+                let corner = popup.place(size);
+                let rect = egui::Rect::from_min_size(corner, size);
+                if popup.placed != Some(rect) {
+                    popup.placed = Some(rect);
+                    popup.height = height;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        POPUP_WIDTH,
+                        height,
+                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        corner.x / scale,
+                        corner.y / scale,
+                    )));
+                }
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    close = true;
+                }
+            },
+        );
+        if open_main_window {
+            self.settings_open = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            close = true;
+        }
+        if !close {
+            self.popup = Some(popup);
+            // Keep polling Esc and outside clicks while the popup is open.
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+    }
+
+    fn draw_popup(
+        &self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        popup: &mut ResultPopup,
+        close: &mut bool,
+        open_main_window: &mut bool,
+    ) {
+        let translated = self.result.translated_text.trim();
+        let source = self.result.source_text.trim();
+        let action = |ui: &mut egui::Ui, text: &str, color: Color32| {
+            ui.add(egui::Button::new(RichText::new(text).small().color(color)).frame(false))
+                .clicked()
+        };
+        ui.horizontal(|ui| {
+            if self.busy() {
+                ui.add(egui::Spinner::new().size(12.0).color(palette.accent));
+                ui.label(RichText::new(&self.status).small().color(palette.muted));
+            } else {
+                ui.label(RichText::new("译文").small().strong().color(palette.muted));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if action(ui, "关闭", palette.muted) {
+                    *close = true;
+                }
+                if !translated.is_empty() {
+                    let label = if popup.copied { "已复制" } else { "复制" };
+                    if action(ui, label, palette.accent) {
+                        ui.ctx().copy_text(translated.to_owned());
+                        popup.copied = true;
+                    }
+                }
+                let (label, color) = if popup.pinned {
+                    ("已固定", palette.accent)
+                } else {
+                    ("固定", palette.muted)
+                };
+                if action(ui, label, color) {
+                    popup.pinned = !popup.pinned;
+                }
+                if action(ui, "主窗口", palette.muted) {
+                    *open_main_window = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .max_height(POPUP_MAX_HEIGHT - 110.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if !translated.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(translated).color(palette.text))
+                            .wrap()
+                            .selectable(true),
+                    );
+                } else if self.busy() {
+                    ui.label(RichText::new("正在识别并翻译…").color(palette.muted));
+                } else {
+                    ui.add(
+                        egui::Label::new(RichText::new(&self.status).color(palette.danger)).wrap(),
+                    );
+                }
+                if popup.show_source && !source.is_empty() {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add(
+                        egui::Label::new(RichText::new(source).color(palette.muted))
+                            .wrap()
+                            .selectable(true),
+                    );
+                }
+            });
+
+        if !source.is_empty() {
+            ui.add_space(2.0);
+            let label = if popup.show_source {
+                "收起原文"
+            } else {
+                "查看原文"
+            };
+            if action(ui, label, palette.accent) {
+                popup.show_source = !popup.show_source;
+            }
+        }
+    }
+
     fn draw_status_bar(&self, ui: &mut egui::Ui, palette: &Palette) {
         egui::Sides::new().shrink_left().show(
             ui,
@@ -941,6 +1211,7 @@ impl eframe::App for OcrTranslateApp {
                     self.draw_result(ui, ctx);
                 }
             });
+        self.show_popup(ctx);
         self.hotkey.set_busy(self.busy());
     }
 }
@@ -1121,6 +1392,7 @@ struct Palette {
     border: Color32,
     text: Color32,
     muted: Color32,
+    danger: Color32,
     accent: Color32,
     on_accent: Color32,
 }
@@ -1137,6 +1409,7 @@ impl Palette {
                 border: Color32::from_rgb(0xE1, 0xE4, 0xEA),
                 text: Color32::from_rgb(0x1F, 0x23, 0x29),
                 muted: Color32::from_rgb(0x6B, 0x72, 0x80),
+                danger: Color32::from_rgb(0xD9, 0x3F, 0x3F),
                 accent: Color32::from_rgb(0x3B, 0x6E, 0xF5),
                 on_accent: Color32::WHITE,
             },
@@ -1149,6 +1422,7 @@ impl Palette {
                 border: Color32::from_rgb(0x2D, 0x32, 0x3C),
                 text: Color32::from_rgb(0xE6, 0xE8, 0xEC),
                 muted: Color32::from_rgb(0x8B, 0x93, 0xA1),
+                danger: Color32::from_rgb(0xF2, 0x6D, 0x6D),
                 accent: Color32::from_rgb(0x5B, 0x8C, 0xFF),
                 on_accent: Color32::WHITE,
             },
@@ -1501,5 +1775,32 @@ mod tests {
         let mut config: AppConfig = serde_json::from_str(r#"{"api_key":"dpapi:AAAA"}"#).unwrap();
         assert_eq!(config.reveal_secrets(), (false, true));
         assert!(config.api_key.is_empty());
+    }
+
+    fn popup_at(anchor: [i32; 2]) -> ResultPopup {
+        ResultPopup {
+            anchor,
+            work_area: [0, 0, 1920, 1040],
+            opened_at: Instant::now(),
+            pinned: false,
+            show_source: false,
+            copied: false,
+            placed: None,
+            height: 120.0,
+            escape_was_down: false,
+            click_was_down: false,
+        }
+    }
+
+    #[test]
+    fn popup_opens_below_right_of_the_selection_end() {
+        let corner = popup_at([500, 300]).place(egui::vec2(400.0, 200.0));
+        assert_eq!(corner, egui::pos2(516.0, 316.0));
+    }
+
+    #[test]
+    fn popup_flips_to_stay_inside_the_work_area() {
+        let corner = popup_at([1900, 1000]).place(egui::vec2(400.0, 200.0));
+        assert_eq!(corner, egui::pos2(1484.0, 784.0));
     }
 }

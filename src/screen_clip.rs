@@ -14,7 +14,8 @@ use eframe::egui;
 use windows::{
     core::{w, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LPARAM, WPARAM},
+        Foundation::{CloseHandle, LPARAM, POINT, WPARAM},
+        Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         System::{
             DataExchange::GetClipboardSequenceNumber,
             Threading::{
@@ -27,12 +28,13 @@ use windows::{
                 GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, HOT_KEY_MODIFIERS,
                 INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
                 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
-                VK_F1, VK_F12, VK_LWIN, VK_MENU, VK_S, VK_SHIFT, VK_T, VK_V,
+                VK_F1, VK_F12, VK_LBUTTON, VK_LWIN, VK_MENU, VK_RBUTTON, VK_S, VK_SHIFT, VK_T,
+                VK_V,
             },
             WindowsAndMessaging::{
-                FindWindowW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-                PeekMessageW, PostThreadMessageW, SetForegroundWindow, ShowWindowAsync, MSG,
-                PM_NOREMOVE, SW_RESTORE, WM_APP, WM_HOTKEY,
+                FindWindowW, GetCursorPos, GetForegroundWindow, GetMessageW,
+                GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetForegroundWindow,
+                ShowWindowAsync, MSG, PM_NOREMOVE, SW_RESTORE, WM_APP, WM_HOTKEY,
             },
         },
     },
@@ -40,6 +42,7 @@ use windows::{
 
 const HOTKEY_ID: i32 = 1;
 const WM_SET_HOTKEY: u32 = WM_APP + 1;
+pub const CANCELLED: &str = "已取消框选截图。";
 const STALE_CAPTURE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,7 +237,7 @@ pub fn listen_for_hotkey(ctx: egui::Context, hotkey: Hotkey) -> HotkeyListener {
                     if !notify(HotkeyEvent::Started) {
                         break;
                     }
-                    let result = capture_region(active);
+                    let result = capture_region_inner(active);
                     if !notify(HotkeyEvent::Captured(result)) {
                         break;
                     }
@@ -278,7 +281,7 @@ pub fn listen_for_hotkey(ctx: egui::Context, hotkey: Hotkey) -> HotkeyListener {
     }
 }
 
-/// `hotkey` is the shortcut that triggered the capture, whose keys must be released first.
+/// Captures for the main window's button, then brings the main window back.
 pub fn capture_region(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
     let result = capture_region_inner(hotkey);
     restore_main_window();
@@ -382,6 +385,7 @@ impl ClipboardBackup {
     }
 }
 
+/// `hotkey` is the shortcut that triggered the capture, whose keys must be released first.
 fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
     // Let the global shortcut keys go before invoking the system snip shortcut.
     if let Some(hotkey) = hotkey {
@@ -410,7 +414,7 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
     while started.elapsed() < Duration::from_secs(60) {
         let escape_is_down = escape_down();
         if escape_is_down && !escape_was_down {
-            return Err("已取消框选截图。".into());
+            return Err(CANCELLED.into());
         }
         escape_was_down = escape_is_down;
 
@@ -422,7 +426,7 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
         } else if overlay_seen {
             let left_at = *overlay_left_at.get_or_insert_with(Instant::now);
             if left_at.elapsed() > Duration::from_millis(1500) {
-                return Err("已取消框选截图。".into());
+                return Err(CANCELLED.into());
             }
         }
 
@@ -448,7 +452,48 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
     Err("等待框选截图超时。若已取消，请重试快捷键。".into())
 }
 
-fn escape_down() -> bool {
+pub fn cursor_position() -> [i32; 2] {
+    let mut point = POINT::default();
+    let _ = unsafe { GetCursorPos(&mut point) };
+    [point.x, point.y]
+}
+
+/// The work area (excluding the taskbar) of the monitor nearest to `point`, in physical pixels,
+/// as `[left, top, right, bottom]`.
+pub fn work_area_at(point: [i32; 2]) -> [i32; 4] {
+    let monitor = unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: point[0],
+                y: point[1],
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        let work = info.rcWork;
+        [work.left, work.top, work.right, work.bottom]
+    } else {
+        [
+            point[0] - 800,
+            point[1] - 600,
+            point[0] + 800,
+            point[1] + 600,
+        ]
+    }
+}
+
+pub fn mouse_button_down() -> bool {
+    [VK_LBUTTON, VK_RBUTTON]
+        .iter()
+        .any(|button| unsafe { GetAsyncKeyState(button.0 as i32) } < 0)
+}
+
+pub fn escape_down() -> bool {
     unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 }
 }
 
