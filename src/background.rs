@@ -280,12 +280,14 @@ impl Background {
             Err(error) => {
                 self.hotkey.set_busy(false);
                 self.session.status = error.clone();
-                self.send(Event::Hotkey(HotkeyEvent::Captured(Err(error.clone()))));
+                // Show the view before the outcome event so the UI opens one provisional
+                // popup that the event then adopts, instead of opening two windows.
                 if !popup {
                     self.report_show(View::Main);
                 } else if error != screen_clip::CANCELLED {
                     self.report_show(View::Popup);
                 }
+                self.send(Event::Hotkey(HotkeyEvent::Captured(Err(error.clone()))));
             }
         }
     }
