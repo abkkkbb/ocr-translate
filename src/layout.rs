@@ -2,10 +2,26 @@
 //! translation can be painted back over the screenshot where the source text was.
 
 use crate::windows_ocr::Word;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// A model can refer to an OCR block by id, or locate text itself on a 0..1000 grid.
+#[derive(Debug, Deserialize)]
+pub struct VisionBlock {
+    #[serde(default)]
+    pub id: Option<usize>,
+    #[serde(default)]
+    pub bbox: Option<[f32; 4]>,
+    #[serde(default, alias = "original")]
+    pub source_text: String,
+    #[serde(default, alias = "translation")]
+    pub translated_text: String,
+    #[serde(default)]
+    pub line_count: Option<u32>,
+}
+
 /// A run of text translated as one unit: a phrase, or a paragraph of wrapped lines.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextBlock {
     /// `[x, y, width, height]` in image pixels.
     pub rect: [f32; 4],
@@ -17,9 +33,11 @@ pub struct TextBlock {
     pub foreground: [u8; 3],
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ImageLayout {
     pub width: u32,
     pub height: u32,
+    #[serde(skip)]
     pub rgba: Vec<u8>,
     pub blocks: Vec<TextBlock>,
     /// Text spread over several columns, like cards or tables, reads better as an image.
@@ -51,6 +69,63 @@ impl ImageLayout {
 
     pub fn source_text(&self) -> String {
         join_lines(self.blocks.iter().map(|block| block.source.as_str()))
+    }
+
+    pub fn apply_vision_blocks(&mut self, blocks: impl IntoIterator<Item = VisionBlock>) {
+        let reference_count = self.blocks.len();
+        for block in blocks {
+            let translated = block.translated_text.trim();
+            if translated.is_empty() {
+                continue;
+            }
+            if let Some(index) = block.id.filter(|&index| index < reference_count) {
+                let reference = &mut self.blocks[index];
+                // Duplicate ids must not overwrite an already mapped translation.
+                if reference.translated.is_none() {
+                    reference.translated = Some(translated.into());
+                    if !block.source_text.trim().is_empty() {
+                        reference.source = block.source_text.trim().into();
+                    }
+                }
+                continue;
+            }
+            let Some(rect) = block.bbox.and_then(|bbox| self.model_rect(bbox)) else {
+                continue;
+            };
+            let (background, foreground) = sample_colors(&self.rgba, self.width, self.height, rect);
+            self.blocks.push(TextBlock {
+                rect,
+                line_height: (rect[3] / block.line_count.unwrap_or(1).clamp(1, 100) as f32)
+                    .max(1.0),
+                source: block.source_text.trim().into(),
+                translated: Some(translated.into()),
+                background,
+                foreground,
+            });
+        }
+        self.dispersed = is_dispersed(&self.blocks);
+    }
+
+    fn model_rect(&self, bbox: [f32; 4]) -> Option<[f32; 4]> {
+        let [x, y, width, height] = bbox;
+        if !bbox.iter().all(|value| value.is_finite()) || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let left = x.clamp(0.0, 1000.0);
+        let top = y.clamp(0.0, 1000.0);
+        let right = (x + width).clamp(0.0, 1000.0);
+        let bottom = (y + height).clamp(0.0, 1000.0);
+        if right <= left || bottom <= top {
+            return None;
+        }
+        let sx = self.width as f32 / 1000.0;
+        let sy = self.height as f32 / 1000.0;
+        Some([
+            left * sx,
+            top * sy,
+            (right - left) * sx,
+            (bottom - top) * sy,
+        ])
     }
 
     /// Indexes of blocks worth sending to a translator.
@@ -260,6 +335,70 @@ fn sample_colors(rgba: &[u8], width: u32, height: u32, rect: [f32; 4]) -> ([u8; 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blank_page() -> ImageLayout {
+        ImageLayout {
+            width: 200,
+            height: 100,
+            rgba: [250, 250, 250, 255].repeat(200 * 100),
+            blocks: Vec::new(),
+            dispersed: false,
+        }
+    }
+
+    #[test]
+    fn layout_loads_every_selectable_image_format() {
+        for extension in ["png", "jpg", "webp", "bmp"] {
+            let path = std::env::temp_dir().join(format!(
+                "ocr-layout-format-test-{}.{extension}",
+                std::process::id()
+            ));
+            image::RgbImage::from_pixel(20, 10, image::Rgb([240, 240, 240]))
+                .save(&path)
+                .unwrap();
+            let result = ImageLayout::build(&path, Vec::new());
+            let _ = std::fs::remove_file(path);
+            let page = result.unwrap();
+            assert_eq!((page.width, page.height), (20, 10));
+        }
+    }
+
+    #[test]
+    fn vision_boxes_scale_to_image_pixels_and_clip_at_edges() {
+        let mut page = blank_page();
+        let blocks: Vec<VisionBlock> = serde_json::from_value(serde_json::json!([
+            {"bbox": [100, 200, 400, 300], "source_text": "Hello", "translated_text": "你好", "line_count": 2},
+            {"bbox": [900, 900, 200, 200], "translated_text": "边缘"},
+            {"bbox": [1001, 0, 20, 20], "translated_text": "外部"},
+            {"bbox": [0, 0, -20, 20], "translated_text": "无效"},
+            {"bbox": [0, 0, 20, 20], "translated_text": " "}
+        ])).unwrap();
+        page.apply_vision_blocks(blocks);
+        assert_eq!(page.blocks.len(), 2);
+        assert_eq!(page.blocks[0].rect, [20.0, 20.0, 80.0, 30.0]);
+        assert_eq!(page.blocks[0].line_height, 15.0);
+        assert_eq!(page.blocks[0].translated.as_deref(), Some("你好"));
+        assert_eq!(page.blocks[0].background, [250; 3]);
+        assert_eq!(page.blocks[1].rect, [180.0, 90.0, 20.0, 10.0]);
+        assert!(page.model_rect([f32::NAN, 0.0, 10.0, 10.0]).is_none());
+    }
+
+    #[test]
+    fn vision_ids_preserve_ocr_positions_and_ignore_duplicate_ids() {
+        let mut page = blank_page();
+        page.blocks = group_blocks(vec![vec![word("He11o", 10.0, 10.0, 50.0)]]);
+        let original_rect = page.blocks[0].rect;
+        let blocks: Vec<VisionBlock> = serde_json::from_value(serde_json::json!([
+            {"id": 0, "bbox": [0, 0, 1000, 1000], "source_text": "Hello", "translated_text": "你好"},
+            {"id": 0, "translated_text": "重复"},
+            {"id": 5, "translated_text": "未知"}
+        ])).unwrap();
+        page.apply_vision_blocks(blocks);
+        assert_eq!(page.blocks.len(), 1);
+        assert_eq!(page.blocks[0].rect, original_rect);
+        assert_eq!(page.blocks[0].source, "Hello");
+        assert_eq!(page.blocks[0].translated.as_deref(), Some("你好"));
+    }
 
     fn word(text: &str, x: f32, y: f32, width: f32) -> Word {
         Word {

@@ -10,11 +10,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use eframe::egui;
 use windows::{
-    core::{w, PWSTR},
+    core::{w, BOOL, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LPARAM, POINT, WPARAM},
+        Foundation::{CloseHandle, HWND, LPARAM, POINT, WPARAM},
         Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         System::{
             DataExchange::GetClipboardSequenceNumber,
@@ -25,16 +24,16 @@ use windows::{
         },
         UI::{
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, HOT_KEY_MODIFIERS,
-                INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-                MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
-                VK_F1, VK_F12, VK_LBUTTON, VK_LWIN, VK_MENU, VK_RBUTTON, VK_S, VK_SHIFT, VK_T,
-                VK_V,
+                GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT,
+                MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_F1,
+                VK_F12, VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT, VK_T, VK_V,
             },
+            Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                FindWindowW, GetCursorPos, GetForegroundWindow, GetMessageW,
-                GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetForegroundWindow,
-                ShowWindowAsync, MSG, PM_NOREMOVE, SW_RESTORE, WM_APP, WM_HOTKEY,
+                EnumWindows, FindWindowW, GetCursorPos, GetForegroundWindow, GetMessageW,
+                GetWindowThreadProcessId, IsWindowVisible, PeekMessageW, PostThreadMessageW,
+                SetForegroundWindow, ShowWindowAsync, MSG, PM_NOREMOVE, SW_RESTORE, SW_SHOWNORMAL,
+                WM_APP, WM_HOTKEY,
             },
         },
     },
@@ -45,7 +44,7 @@ const WM_SET_HOTKEY: u32 = WM_APP + 1;
 pub const CANCELLED: &str = "已取消框选截图。";
 const STALE_CAPTURE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hotkey {
     pub ctrl: bool,
     pub alt: bool,
@@ -157,6 +156,7 @@ impl fmt::Display for Hotkey {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum HotkeyEvent {
     Ready(Hotkey),
     Busy,
@@ -176,6 +176,15 @@ pub struct HotkeyListener {
 }
 
 impl HotkeyListener {
+    #[cfg(test)]
+    pub fn test_stub() -> Self {
+        let (_tx, events) = mpsc::channel();
+        Self {
+            events,
+            busy: Arc::new(AtomicBool::new(false)),
+            thread_id: 0,
+        }
+    }
     /// Presses arriving while the app is busy are reported as `Busy` instead of starting a capture.
     pub fn set_busy(&self, busy: bool) {
         self.busy.store(busy, Ordering::Release);
@@ -193,7 +202,7 @@ fn register(hotkey: Hotkey) -> windows::core::Result<()> {
 }
 
 /// RegisterHotKey delivers WM_HOTKEY to the registering thread's message queue.
-pub fn listen_for_hotkey(ctx: egui::Context, hotkey: Hotkey) -> HotkeyListener {
+pub fn listen_for_hotkey(wake: impl Fn() + Send + 'static, hotkey: Hotkey) -> HotkeyListener {
     let (tx, rx) = mpsc::channel();
     let (thread_id_tx, thread_id_rx) = mpsc::sync_channel(1);
     let busy = Arc::new(AtomicBool::new(false));
@@ -205,7 +214,7 @@ pub fn listen_for_hotkey(ctx: egui::Context, hotkey: Hotkey) -> HotkeyListener {
         let _ = thread_id_tx.send(unsafe { GetCurrentThreadId() });
         let notify = |event: HotkeyEvent| {
             let sent = tx.send(event).is_ok();
-            ctx.request_repaint();
+            wake();
             sent
         };
 
@@ -282,6 +291,10 @@ pub fn listen_for_hotkey(ctx: egui::Context, hotkey: Hotkey) -> HotkeyListener {
 }
 
 /// Captures for the main window's button, then brings the main window back.
+pub fn capture_region_background() -> Result<PathBuf, String> {
+    capture_region_inner(None)
+}
+
 pub fn capture_region(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
     let result = capture_region_inner(hotkey);
     restore_main_window();
@@ -387,7 +400,7 @@ impl ClipboardBackup {
 
 /// `hotkey` is the shortcut that triggered the capture, whose keys must be released first.
 fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
-    // Let the global shortcut keys go before invoking the system snip shortcut.
+    // Let the triggering keys go before opening the system selector.
     if let Some(hotkey) = hotkey {
         let keys = [VK_CONTROL, VK_SHIFT, VK_MENU, VIRTUAL_KEY(hotkey.key)];
         let release_deadline = Instant::now() + Duration::from_secs(3);
@@ -418,9 +431,8 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
         }
         escape_was_down = escape_is_down;
 
-        // The selector is a foreground Snipping Tool window. Once it has been seen and then
-        // loses the foreground without a new clipboard image, the user cancelled it.
-        if foreground_is_snipping_tool() {
+        // Some Windows builds show a non-activating selector, leaving another app foreground.
+        if snipping_tool_visible() {
             overlay_seen = true;
             overlay_left_at = None;
         } else if overlay_seen {
@@ -428,6 +440,8 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
             if left_at.elapsed() > Duration::from_millis(1500) {
                 return Err(CANCELLED.into());
             }
+        } else if started.elapsed() > Duration::from_secs(10) {
+            return Err("Windows 截图框未能打开，请检查系统截图工具后重试。".into());
         }
 
         let current = unsafe { GetClipboardSequenceNumber() };
@@ -497,9 +511,26 @@ pub fn escape_down() -> bool {
     unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 }
 }
 
-fn foreground_is_snipping_tool() -> bool {
+fn snipping_tool_visible() -> bool {
+    if window_is_snipping_tool(unsafe { GetForegroundWindow() }) {
+        return true;
+    }
+    unsafe extern "system" fn visit(window: HWND, data: LPARAM) -> BOOL {
+        if unsafe { IsWindowVisible(window) }.as_bool() && window_is_snipping_tool(window) {
+            unsafe { *(data.0 as *mut bool) = true };
+            BOOL(0)
+        } else {
+            BOOL(1)
+        }
+    }
+    let mut found = false;
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut found as *mut bool as isize)) };
+    found
+}
+
+fn window_is_snipping_tool(window: HWND) -> bool {
     let mut process_id = 0;
-    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process_id)) };
+    unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
     if process_id == 0 {
         return false;
     }
@@ -548,41 +579,20 @@ fn save_image(data: arboard::ImageData<'_>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn key_event(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: key,
-                dwFlags: if key_up {
-                    KEYEVENTF_KEYUP
-                } else {
-                    KEYBD_EVENT_FLAGS(0)
-                },
-                ..Default::default()
-            },
-        },
-    }
-}
-
 fn open_windows_snip() -> Result<(), String> {
-    let inputs = [
-        key_event(VK_LWIN, false),
-        key_event(VK_SHIFT, false),
-        key_event(VK_S, false),
-        key_event(VK_S, true),
-        key_event(VK_SHIFT, true),
-        key_event(VK_LWIN, true),
-    ];
-    let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if inserted != inputs.len() as u32 {
-        let releases = [
-            key_event(VK_S, true),
-            key_event(VK_SHIFT, true),
-            key_event(VK_LWIN, true),
-        ];
-        unsafe { SendInput(&releases, std::mem::size_of::<INPUT>() as i32) };
-        return Err("无法启动 Windows 框选截图；请确认系统支持 Win+Shift+S。".into());
+    // The protocol invokes the selector directly, without depending on synthetic key state.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            w!("ms-screenclip:"),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        return Err("无法启动 Windows 截图工具，请确认系统已安装截图工具。".into());
     }
     Ok(())
 }

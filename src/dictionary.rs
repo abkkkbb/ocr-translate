@@ -9,7 +9,7 @@ use std::time::Duration;
 const MAX_MEANINGS: usize = 8;
 const MAX_EXAMPLES: usize = 3;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub word: String,
     pub uk_phonetic: Option<String>,

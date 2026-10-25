@@ -1,11 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
 mod dictionary;
 mod free_translate;
+mod ipc;
 mod layout;
 mod net;
 mod screen_clip;
 mod secret_store;
+mod single_instance;
+mod tray;
 mod volcengine;
 mod windows_ocr;
 
@@ -18,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         mpsc::{self, Receiver},
-        Arc,
+        Arc, Weak,
     },
     thread,
     time::{Duration, Instant},
@@ -78,12 +82,31 @@ enum ThemeMode {
     Night,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CloseBehavior {
+    #[default]
+    #[serde(alias = "ask")]
+    Tray,
+    Exit,
+}
+
+impl CloseBehavior {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tray => "隐藏到托盘",
+            Self::Exit => "直接退出",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct AppConfig {
     mode: TranslationMode,
     theme: ThemeMode,
     font_size: u8,
+    close_behavior: CloseBehavior,
     ocr_language: String,
     api_url: String,
     api_key: String,
@@ -102,6 +125,7 @@ impl Default for AppConfig {
             mode: TranslationMode::Tencent,
             theme: ThemeMode::Night,
             font_size: DEFAULT_FONT_SIZE,
+            close_behavior: CloseBehavior::Tray,
             ocr_language: "en-US".into(),
             api_url: "https://api.openai.com/v1/chat/completions".into(),
             api_key: String::new(),
@@ -184,12 +208,68 @@ struct ResultPopup {
     /// Image view (translation painted over the capture) or text view; decided per result.
     image_view: Option<bool>,
     /// The capture uploaded for the image view, keyed by the layout it came from.
-    texture: Option<(usize, egui::TextureHandle)>,
+    texture: Option<(Weak<layout::ImageLayout>, egui::TextureHandle)>,
     escape_was_down: bool,
     click_was_down: bool,
 }
 
 impl ResultPopup {
+    /// Keep a texture only while it is actually displayed, at the physical display size.
+    fn prepare_texture(
+        &mut self,
+        ctx: &egui::Context,
+        page: Option<&Arc<layout::ImageLayout>>,
+        size: Option<egui::Vec2>,
+    ) {
+        let Some((page, size)) = page.zip(size).filter(|_| self.image_view == Some(true)) else {
+            self.texture = None;
+            return;
+        };
+        // A weak reference prevents a reused allocation address from matching an older image.
+        let key = Arc::downgrade(page);
+        let pixels = size * ctx.pixels_per_point();
+        let limit = ctx.input(|input| input.max_texture_side).max(1);
+        let scale = (limit as f32 / pixels.x.max(pixels.y)).min(1.0);
+        let dimensions = [
+            (pixels.x * scale).ceil().max(1.0) as usize,
+            (pixels.y * scale).ceil().max(1.0) as usize,
+        ];
+        let dimensions = [
+            dimensions[0].min(page.width as usize),
+            dimensions[1].min(page.height as usize),
+        ];
+        if self
+            .texture
+            .as_ref()
+            .is_some_and(|(loaded, texture)| loaded.ptr_eq(&key) && texture.size() == dimensions)
+        {
+            return;
+        }
+        // Drop the previous handle before allocating the replacement.
+        self.texture = None;
+        let image = if dimensions == [page.width as usize, page.height as usize] {
+            egui::ColorImage::from_rgba_unmultiplied(dimensions, &page.rgba)
+        } else {
+            let original = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+                page.width,
+                page.height,
+                page.rgba.as_slice(),
+            )
+            .expect("layout contains a complete RGBA image");
+            let resized = image::imageops::resize(
+                &original,
+                dimensions[0] as u32,
+                dimensions[1] as u32,
+                image::imageops::FilterType::Triangle,
+            );
+            egui::ColorImage::from_rgba_unmultiplied(dimensions, resized.as_raw())
+        };
+        self.texture = Some((
+            key,
+            ctx.load_texture("capture", image, egui::TextureOptions::LINEAR),
+        ));
+    }
+
     fn at_cursor() -> Self {
         let anchor = screen_clip::cursor_position();
         Self {
@@ -252,7 +332,7 @@ impl ResultPopup {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct TranslationResult {
     source_text: String,
     translated_text: String,
@@ -262,6 +342,16 @@ struct TranslationResult {
     dictionary: Option<Arc<dictionary::Entry>>,
 }
 
+impl TranslationResult {
+    /// The main window needs only text; the file remains available for retranslation.
+    fn release_unused_image(&mut self, popup_open: bool, busy: bool) {
+        if !popup_open && !busy {
+            self.layout = None;
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 enum RequestResult {
     Source(String),
     Success(TranslationResult),
@@ -269,6 +359,12 @@ enum RequestResult {
 }
 
 struct OcrTranslateApp {
+    client: ipc::Client,
+    tray_available: bool,
+    lightweight: bool,
+    suspending: bool,
+    main_visible: bool,
+    exit_requested: bool,
     config: AppConfig,
     config_path: PathBuf,
     result: TranslationResult,
@@ -276,7 +372,6 @@ struct OcrTranslateApp {
     temporary_capture: Option<PathBuf>,
     request_rx: Option<Receiver<RequestResult>>,
     capture_rx: Option<Receiver<Result<PathBuf, String>>>,
-    hotkey: screen_clip::HotkeyListener,
     active_hotkey: Option<screen_clip::Hotkey>,
     shortcut_draft: screen_clip::Hotkey,
     hotkey_capture_active: bool,
@@ -292,7 +387,10 @@ struct OcrTranslateApp {
 }
 
 impl OcrTranslateApp {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let ctx = &cc.egui_ctx;
+        tray::AppTray::bind_window(cc);
+        let client = ipc::Client::connect(ctx.clone());
         let config_path = config_path();
         let config_existed = config_path.exists();
         let mut config = load_config(&config_path);
@@ -304,7 +402,6 @@ impl OcrTranslateApp {
         config.shortcut = shortcut.to_string();
         apply_appearance(ctx, &config);
         net::set_proxy(config.proxy());
-        thread::spawn(screen_clip::remove_stale_captures);
         let ocr_languages = windows_ocr::available_languages();
         if config.ocr_language != "auto"
             && !ocr_languages.iter().any(|tag| tag == &config.ocr_language)
@@ -312,6 +409,12 @@ impl OcrTranslateApp {
             config.ocr_language = "auto".into();
         }
         let mut app = Self {
+            client,
+            tray_available: true,
+            lightweight: false,
+            suspending: false,
+            main_visible: false,
+            exit_requested: false,
             config,
             config_path,
             result: TranslationResult::default(),
@@ -319,7 +422,6 @@ impl OcrTranslateApp {
             temporary_capture: None,
             request_rx: None,
             capture_rx: None,
-            hotkey: screen_clip::listen_for_hotkey(ctx.clone(), shortcut),
             active_hotkey: None,
             shortcut_draft: shortcut,
             hotkey_capture_active: false,
@@ -349,6 +451,180 @@ impl OcrTranslateApp {
 
     fn busy(&self) -> bool {
         self.request_rx.is_some() || self.capture_rx.is_some() || self.hotkey_capture_active
+    }
+
+    fn reveal_main_window(&mut self, ctx: &egui::Context) {
+        self.main_visible = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn apply_close_behavior(&mut self, behavior: CloseBehavior, ctx: &egui::Context) {
+        self.popup = None;
+        match behavior {
+            CloseBehavior::Tray => {
+                self.main_visible = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            CloseBehavior::Exit => {
+                let _ = self.client.send(ipc::Command::Quit);
+                self.exit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn begin_remote_request(&mut self) {
+        let (_tx, rx) = mpsc::channel();
+        self.request_rx = Some(rx);
+        // Completion arrives through the private IPC channel, not this receiver.
+        self.result = TranslationResult::default();
+    }
+
+    fn show_view(&mut self, view: ipc::View, ctx: &egui::Context) {
+        match view {
+            ipc::View::Main | ipc::View::Settings => {
+                self.lightweight = false;
+                self.settings_open = matches!(view, ipc::View::Settings);
+                self.reveal_main_window(ctx);
+            }
+            ipc::View::Popup => {
+                self.popup = Some(ResultPopup::at_cursor());
+            }
+        }
+    }
+
+    fn restore_pixels(&mut self) {
+        if let (Some(page), Some(path)) = (&mut self.result.layout, &self.selected_file) {
+            match image::open(path).map(|image| image.to_rgba8()) {
+                Ok(image) if image.dimensions() == (page.width, page.height) => {
+                    Arc::make_mut(page).rgba = image.into_raw();
+                }
+                _ => {
+                    self.result.layout = None;
+                    self.status = "图片无法重新加载，已保留文字翻译。".into();
+                }
+            }
+        }
+    }
+
+    fn poll_backend(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.client.events.try_recv() {
+            match event {
+                ipc::Event::Init {
+                    session,
+                    view,
+                    lightweight,
+                    tray_available,
+                    active_hotkey,
+                    busy,
+                } => {
+                    if let Some(config) = session.config {
+                        self.config = config;
+                        apply_appearance(ctx, &self.config);
+                        net::set_proxy(self.config.proxy());
+                    }
+                    self.shortcut_draft =
+                        screen_clip::Hotkey::parse(&self.config.shortcut).unwrap_or_default();
+                    self.active_hotkey = active_hotkey;
+                    self.result = session.result;
+                    self.selected_file = session.selected_file;
+                    self.temporary_capture = session.temporary_capture;
+                    if !session.status.is_empty() {
+                        self.status = session.status;
+                    }
+                    self.lightweight = lightweight;
+                    self.tray_available = tray_available;
+                    self.restore_pixels();
+                    self.show_view(view, ctx);
+                    if let (Some(anchor), Some(popup)) = (session.anchor, &mut self.popup) {
+                        popup.anchor = anchor;
+                        popup.work_area = screen_clip::work_area_at(anchor);
+                    }
+                    if busy {
+                        let (_tx, rx) = mpsc::channel();
+                        self.request_rx = Some(rx);
+                    }
+                }
+                ipc::Event::Show(view) => {
+                    self.suspending = false;
+                    self.show_view(view, ctx);
+                }
+                ipc::Event::Lightweight(enabled) => {
+                    self.suspending = false;
+                    self.lightweight = enabled;
+                }
+                ipc::Event::Hotkey(event) => self.handle_hotkey(event),
+                ipc::Event::Accepted {
+                    path,
+                    popup,
+                    anchor,
+                } => {
+                    self.hotkey_capture_active = false;
+                    self.capture_rx = None;
+                    self.selected_file = Some(path.clone());
+                    self.temporary_capture = Some(path);
+                    self.begin_remote_request();
+                    if popup {
+                        let mut result_popup = ResultPopup::at_cursor();
+                        result_popup.anchor = anchor;
+                        result_popup.work_area = screen_clip::work_area_at(anchor);
+                        self.popup = Some(result_popup);
+                    } else {
+                        self.reveal_main_window(ctx);
+                    }
+                    self.status = "正在识别并翻译…".into();
+                }
+                ipc::Event::Request(message) => match message {
+                    RequestResult::Source(source) => {
+                        self.result.source_text = source;
+                        self.status = "识别完成，正在翻译…".into();
+                    }
+                    RequestResult::Success(result) => {
+                        self.request_rx = None;
+                        self.capture_rx = None;
+                        self.hotkey_capture_active = false;
+                        self.result = result;
+                        self.restore_pixels();
+                        self.status = "翻译完成。".into();
+                    }
+                    RequestResult::Error(error) => {
+                        self.request_rx = None;
+                        self.capture_rx = None;
+                        self.hotkey_capture_active = false;
+                        self.status = error;
+                    }
+                },
+                ipc::Event::Quit => {
+                    self.exit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn finish_frame(&mut self, ctx: &egui::Context) {
+        let busy = self.busy();
+        self.result.release_unused_image(self.popup.is_some(), busy);
+        if self.lightweight && !busy && self.popup.is_none() && !self.suspending {
+            let session = ipc::Session {
+                config: Some(self.config.clone()),
+                result: self.result.clone(),
+                selected_file: self.selected_file.clone(),
+                temporary_capture: self.temporary_capture.clone(),
+                status: self.status.clone(),
+                anchor: None,
+            };
+            if let Err(error) = self.client.send(ipc::Command::Suspend(Box::new(session))) {
+                self.status = error;
+            } else {
+                self.suspending = true;
+            }
+        }
+        if self.suspending {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn shortcut_label(&self) -> String {
@@ -383,10 +659,11 @@ impl OcrTranslateApp {
             Ok(()) => "设置已保存。".into(),
             Err(error) => error,
         };
-        if self.active_hotkey != Some(self.shortcut_draft) {
-            if let Err(error) = self.hotkey.change(self.shortcut_draft) {
-                self.status = error;
-            }
+        if let Err(error) = self
+            .client
+            .send(ipc::Command::Config(Box::new(self.config.clone())))
+        {
+            self.status = error;
         }
     }
 
@@ -395,9 +672,7 @@ impl OcrTranslateApp {
             .add_filter("图片", &["png", "jpg", "jpeg", "webp", "bmp"])
             .pick_file();
         if let Some(path) = picked {
-            if let Some(previous) = self.temporary_capture.take() {
-                let _ = fs::remove_file(previous);
-            }
+            self.temporary_capture = None;
             self.selected_file = Some(path.clone());
             self.start_translation(path, ctx);
         }
@@ -408,86 +683,57 @@ impl OcrTranslateApp {
             return;
         }
         self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
-        let (tx, rx) = mpsc::channel();
-        self.capture_rx = Some(rx);
-        self.hotkey.set_busy(true);
+        self.hotkey_capture_active = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        thread::spawn(move || {
-            thread::sleep(std::time::Duration::from_millis(250));
-            let _ = tx.send(screen_clip::capture_region(None));
-        });
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
-
-    fn poll_screen_capture(&mut self, ctx: &egui::Context) {
-        let received = self.capture_rx.as_ref().map(|rx| rx.try_recv());
-        match received {
-            Some(Ok(Ok(path))) => {
-                self.capture_rx = None;
-                self.accept_capture(path, true, ctx);
-            }
-            Some(Ok(Err(error))) => {
-                self.capture_rx = None;
-                self.status = error;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                self.capture_rx = None;
-                self.status = "截图任务意外结束。".into();
-            }
-            _ => {
-                if self.capture_rx.is_some() {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                }
-            }
+        if let Err(error) = self
+            .client
+            .send(ipc::Command::Capture(Box::new(self.config.clone())))
+        {
+            self.hotkey_capture_active = false;
+            self.status = error;
+            self.reveal_main_window(ctx);
         }
     }
 
-    fn poll_hotkey(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.hotkey.events.try_recv() {
-            match event {
-                screen_clip::HotkeyEvent::Ready(hotkey) => {
-                    let previous = self.active_hotkey.replace(hotkey);
-                    if previous.is_some_and(|previous| previous != hotkey) {
-                        self.status = format!("全局快捷键已更新为 {hotkey}。");
-                    }
+    fn handle_hotkey(&mut self, event: screen_clip::HotkeyEvent) {
+        match event {
+            screen_clip::HotkeyEvent::Ready(hotkey) => {
+                let previous = self.active_hotkey.replace(hotkey);
+                if previous.is_some_and(|previous| previous != hotkey) {
+                    self.status = format!("全局快捷键已更新为 {hotkey}。");
                 }
-                screen_clip::HotkeyEvent::Busy => {
-                    self.status = "上一项截图或翻译还在进行，请完成后再按快捷键。".into();
-                    if self.popup.is_none() {
-                        self.popup = Some(ResultPopup::at_cursor());
-                    }
-                }
-                screen_clip::HotkeyEvent::Started => {
-                    self.hotkey_capture_active = true;
-                    self.popup = None;
-                    self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
-                }
-                screen_clip::HotkeyEvent::Captured(Ok(path)) => {
-                    self.hotkey_capture_active = false;
-                    // The selection ends where the mouse was released, so open the popup there.
+            }
+            screen_clip::HotkeyEvent::Busy => {
+                self.status = "上一项截图或翻译还在进行，请完成后再按快捷键。".into();
+                if self.popup.is_none() {
                     self.popup = Some(ResultPopup::at_cursor());
-                    self.accept_capture(path, false, ctx);
                 }
-                screen_clip::HotkeyEvent::Captured(Err(error)) => {
-                    self.hotkey_capture_active = false;
-                    if error != screen_clip::CANCELLED {
-                        self.popup = Some(ResultPopup::at_cursor());
-                    }
-                    self.status = error;
+            }
+            screen_clip::HotkeyEvent::Started => {
+                self.hotkey_capture_active = true;
+                self.popup = None;
+                self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
+            }
+            screen_clip::HotkeyEvent::Captured(Ok(path)) => {
+                self.selected_file = Some(path);
+            }
+            screen_clip::HotkeyEvent::Captured(Err(error)) => {
+                self.hotkey_capture_active = false;
+                if error != screen_clip::CANCELLED {
+                    self.popup = Some(ResultPopup::at_cursor());
                 }
-                screen_clip::HotkeyEvent::Failed { message, active } => {
-                    self.status = message;
-                    self.active_hotkey = active;
-                    // The listener fell back to the previous shortcut; keep the saved setting
-                    // in step so the next launch does not retry the rejected one.
-                    if let Some(active) = active {
-                        if self.config.shortcut != active.to_string() {
-                            self.config.shortcut = active.to_string();
-                            self.shortcut_draft = active;
-                            let _ = self.write_config();
-                        }
+                self.status = error;
+            }
+            screen_clip::HotkeyEvent::Failed { message, active } => {
+                self.status = message;
+                self.active_hotkey = active;
+                // The listener fell back to the previous shortcut; keep the saved setting
+                // in step so the next launch does not retry the rejected one.
+                if let Some(active) = active {
+                    if self.config.shortcut != active.to_string() {
+                        self.config.shortcut = active.to_string();
+                        self.shortcut_draft = active;
+                        let _ = self.write_config();
                     }
                 }
             }
@@ -496,14 +742,11 @@ impl OcrTranslateApp {
 
     /// Hotkey captures leave the main window alone and show their result in the popup.
     fn accept_capture(&mut self, path: PathBuf, reveal_main_window: bool, ctx: &egui::Context) {
-        if let Some(previous) = self.temporary_capture.replace(path.clone()) {
-            let _ = fs::remove_file(previous);
-        }
+        self.temporary_capture = Some(path.clone());
         self.selected_file = Some(path.clone());
         self.settings_open = false;
         if reveal_main_window {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.reveal_main_window(ctx);
         }
         self.start_translation(path, ctx);
     }
@@ -550,44 +793,23 @@ impl OcrTranslateApp {
             return;
         }
 
-        let config = self.config.clone();
-        let (tx, rx) = mpsc::channel();
-        self.request_rx = Some(rx);
-        self.result = TranslationResult::default();
+        self.begin_remote_request();
+        if let Some(popup) = &mut self.popup {
+            popup.texture = None;
+            popup.image_view = None;
+        }
         self.status = "正在识别并翻译…".into();
         ctx.request_repaint();
 
-        thread::spawn(move || {
-            let result = (|| {
-                if config.mode == TranslationMode::Vision {
-                    return translate_image(&config, &path);
-                }
-                validate_image_size(&path)?;
-                let lines = windows_ocr::recognize_lines(&path, &config.ocr_language)?;
-                let mut page = layout::ImageLayout::build(&path, lines)?;
-                let source = page.source_text();
-                let _ = tx.send(RequestResult::Source(source.clone()));
-                // Each block is translated on its own so the result maps back onto the image.
-                let indexes = page.translatable();
-                let texts: Vec<String> = indexes
-                    .iter()
-                    .map(|&index| page.blocks[index].source.clone())
-                    .collect();
-                for (index, translated) in indexes.into_iter().zip(translate_many(&config, &texts)?)
-                {
-                    page.blocks[index].translated = Some(translated);
-                }
-                Ok(TranslationResult {
-                    source_text: source,
-                    translated_text: page.translated_text(),
-                    layout: Some(Arc::new(page)),
-                    dictionary: None,
-                })
-            })()
-            .map(|result| RequestResult::Success(with_dictionary(&config, result)))
-            .unwrap_or_else(RequestResult::Error);
-            let _ = tx.send(result);
-        });
+        let temporary = self.temporary_capture.as_ref() == Some(&path);
+        if let Err(error) = self.client.send(ipc::Command::Image {
+            config: Box::new(self.config.clone()),
+            path,
+            temporary,
+        }) {
+            self.request_rx = None;
+            self.status = error;
+        }
     }
 
     fn start_text_translation(&mut self, ctx: &egui::Context) {
@@ -600,55 +822,23 @@ impl OcrTranslateApp {
             return;
         }
 
-        let config = self.config.clone();
-        let (tx, rx) = mpsc::channel();
-        self.request_rx = Some(rx);
+        self.begin_remote_request();
+        self.result.source_text = source.clone();
+        self.result.layout = None;
+        if let Some(popup) = &mut self.popup {
+            popup.texture = None;
+            popup.image_view = None;
+        }
         self.result.translated_text.clear();
         self.status = "正在翻译…".into();
         ctx.request_repaint();
 
-        thread::spawn(move || {
-            let result = (|| {
-                let translated = translate_text(&config, &source)?;
-                Ok(TranslationResult {
-                    source_text: source,
-                    translated_text: translated,
-                    layout: None,
-                    dictionary: None,
-                })
-            })()
-            .map(|result| RequestResult::Success(with_dictionary(&config, result)))
-            .unwrap_or_else(RequestResult::Error);
-            let _ = tx.send(result);
-        });
-    }
-
-    fn poll_request(&mut self, ctx: &egui::Context) {
-        let received = self.request_rx.as_ref().map(|rx| rx.try_recv());
-        if let Some(message) = received {
-            match message {
-                Ok(RequestResult::Source(source)) => {
-                    self.result.source_text = source;
-                    self.status = "识别完成，正在翻译…".into();
-                }
-                Ok(RequestResult::Success(result)) => {
-                    self.request_rx = None;
-                    self.result = result;
-                    self.status = "翻译完成。".into();
-                }
-                Ok(RequestResult::Error(error)) => {
-                    self.request_rx = None;
-                    self.status = error;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.request_rx = None;
-                    self.status = "翻译任务意外结束。".into();
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            ctx.request_repaint();
-        } else if self.request_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if let Err(error) = self.client.send(ipc::Command::Text {
+            config: Box::new(self.config.clone()),
+            source,
+        }) {
+            self.request_rx = None;
+            self.status = error;
         }
     }
 
@@ -717,6 +907,20 @@ impl OcrTranslateApp {
                     {
                         apply_appearance(ui.ctx(), &self.config);
                     }
+                    ui.end_row();
+
+                    field_label(ui, palette, "关闭主窗口时");
+                    egui::ComboBox::from_id_salt("close_behavior")
+                        .selected_text(self.config.close_behavior.label())
+                        .show_ui(ui, |ui| {
+                            for behavior in [CloseBehavior::Tray, CloseBehavior::Exit] {
+                                ui.selectable_value(
+                                    &mut self.config.close_behavior,
+                                    behavior,
+                                    behavior.label(),
+                                );
+                            }
+                        });
                     ui.end_row();
                 });
         });
@@ -866,7 +1070,7 @@ impl OcrTranslateApp {
         let ctx = ctx.clone();
         thread::spawn(move || {
             let _ = tx.send(volcengine::query_usage(&access_key, &secret_key));
-            ctx.request_repaint();
+            tray::wake(&ctx);
         });
     }
 
@@ -881,10 +1085,10 @@ impl OcrTranslateApp {
                 self.usage_rx = None;
                 self.volcengine_usage = Some(Err("费用查询意外结束。".into()));
             }
-            Some(Err(mpsc::TryRecvError::Empty)) => {
+            Some(Err(mpsc::TryRecvError::Empty)) if tray::main_window_visible() => {
                 ctx.request_repaint_after(Duration::from_millis(200));
             }
-            None => {}
+            _ => {}
         }
     }
 
@@ -1182,21 +1386,10 @@ impl OcrTranslateApp {
         let root_scale = ctx.pixels_per_point();
         let page = self.result.layout.clone().filter(|_| !self.busy());
         if let Some(page) = &page {
-            // Scattered text such as cards reads better in place; prose reads better as text.
-            popup.image_view.get_or_insert(page.dispersed);
-            let key = Arc::as_ptr(page) as usize;
-            if popup
-                .texture
-                .as_ref()
-                .is_none_or(|(loaded, _)| *loaded != key)
-            {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [page.width as usize, page.height as usize],
-                    &page.rgba,
-                );
-                let texture = ctx.load_texture("capture", image, egui::TextureOptions::LINEAR);
-                popup.texture = Some((key, texture));
-            }
+            // Vision captures open as images; OCR prose retains its compact text default.
+            popup
+                .image_view
+                .get_or_insert(self.config.mode == TranslationMode::Vision || page.dispersed);
         }
         let image_view = page.is_some() && popup.image_view == Some(true);
         // Show the capture at its real size, shrunk to fit two thirds of the monitor.
@@ -1245,7 +1438,7 @@ impl OcrTranslateApp {
                                 ui,
                                 &palette,
                                 &mut popup,
-                                image_size.filter(|_| image_view),
+                                image_size,
                                 &mut close,
                                 &mut open_main_window,
                             )
@@ -1280,15 +1473,19 @@ impl OcrTranslateApp {
             },
         );
         if open_main_window {
+            self.lightweight = false;
+            let _ = self.client.send(ipc::Command::Open(ipc::View::Main));
             self.settings_open = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.reveal_main_window(ctx);
             close = true;
         }
         if !close {
+            let pinned = popup.pinned;
             self.popup = Some(popup);
-            // Keep polling Esc and outside clicks while the popup is open.
-            ctx.request_repaint_after(Duration::from_millis(30));
+            // Pinned popups close through their controls, so they need no global input polling.
+            if !pinned {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
         }
     }
 
@@ -1311,7 +1508,7 @@ impl OcrTranslateApp {
             if self.busy() {
                 ui.add(egui::Spinner::new().size(12.0).color(palette.accent));
                 ui.label(RichText::new(&self.status).small().color(palette.muted));
-            } else if self.result.layout.is_some() && popup.texture.is_some() {
+            } else if self.result.layout.is_some() {
                 let mut image_view = popup.image_view == Some(true);
                 if segmented(
                     ui,
@@ -1350,10 +1547,27 @@ impl OcrTranslateApp {
         });
         ui.add_space(4.0);
 
+        popup.prepare_texture(
+            ui.ctx(),
+            self.result.layout.as_ref().filter(|_| !self.busy()),
+            image_size,
+        );
         if let (Some(size), Some(page), Some((_, texture))) =
             (image_size, &self.result.layout, &popup.texture)
         {
             paint_translated_capture(ui, texture, page, size, popup.show_source);
+            if !popup.show_source
+                && !translated.is_empty()
+                && !page.blocks.iter().any(|block| block.translated.is_some())
+            {
+                ui.add_space(6.0);
+                ui.label(RichText::new("译文").small().color(palette.muted));
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(translated).wrap().selectable(true));
+                    });
+            }
             ui.add_space(2.0);
             let label = if popup.show_source {
                 "显示译文"
@@ -1443,10 +1657,24 @@ impl OcrTranslateApp {
 
 impl eframe::App for OcrTranslateApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_hotkey(ctx);
-        self.poll_screen_capture(ctx);
-        self.poll_request(ctx);
+        self.poll_backend(ctx);
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.exit_requested
+            && self.tray_available
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.apply_close_behavior(self.config.close_behavior, ctx);
+        }
+        if self.exit_requested {
+            return;
+        }
         self.poll_usage(ctx);
+        if !self.main_visible || !tray::main_window_visible() {
+            // Workers and native tray/hotkey events wake the root window when needed.
+            self.show_popup(ctx);
+            self.finish_frame(ctx);
+            return;
+        }
         let palette = Palette::of(self.config.theme);
 
         egui::TopBottomPanel::top("top_bar")
@@ -1500,15 +1728,7 @@ impl eframe::App for OcrTranslateApp {
                 }
             });
         self.show_popup(ctx);
-        self.hotkey.set_busy(self.busy());
-    }
-}
-
-impl Drop for OcrTranslateApp {
-    fn drop(&mut self) {
-        if let Some(path) = self.temporary_capture.take() {
-            let _ = fs::remove_file(path);
-        }
+        self.finish_frame(ctx);
     }
 }
 
@@ -1637,6 +1857,17 @@ fn translate_text(config: &AppConfig, source: &str) -> Result<String, String> {
 
 fn translate_image(config: &AppConfig, path: &Path) -> Result<TranslationResult, String> {
     validate_image_size(path)?;
+    // Position hints improve placement, but vision translation also works without an OCR pack.
+    let lines = windows_ocr::recognize_lines(path, &config.ocr_language).unwrap_or_default();
+    let page = layout::ImageLayout::build(path, lines)?;
+    let references: Vec<Value> = page
+        .translatable()
+        .into_iter()
+        .map(|id| {
+            let block = &page.blocks[id];
+            serde_json::json!({"id": id, "source_text": block.source})
+        })
+        .collect();
     let bytes = fs::read(path).map_err(|error| format!("读取图片失败：{error}"))?;
     let mime = match path
         .extension()
@@ -1652,16 +1883,25 @@ fn translate_image(config: &AppConfig, path: &Path) -> Result<TranslationResult,
     };
     let image_data = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
     let prompt = format!(
-        "识别图片中的所有可读文字，并翻译成{}。只返回严格 JSON，不要 Markdown，不要额外说明，格式为 {{\"source_text\":\"原文\",\"translated_text\":\"译文\"}}。保留原文换行。",
-        config.target_language
+        "识别图片中的所有可读文字，并翻译成{}。只返回严格 JSON，不要 Markdown，不要额外说明。\n\
+         格式为 {{\"source_text\":\"完整原文\",\"translated_text\":\"完整译文\",\"blocks\":[{{\"id\":0,\"source_text\":\"该块原文\",\"translated_text\":\"该块译文\"}}]}}。\n\
+         blocks 按阅读顺序逐块翻译。下面的本地 OCR 参考块只是位置提示，可根据图片纠正识别文字；\
+         对每个参考块返回相同的 id 和该块的译文，不要合并不同 id。\n\
+         对参考块之外的文字，或参考块为空时，省略 id，返回 bbox:[x,y,width,height] 和 line_count；\
+         bbox 是原文文字区域的左上角、宽、高，按整张图片归一化为 0 到 1000（不是右下角坐标），\
+         line_count 是该区域的原文行数。不要给同一文字重复返回多个块。\n\
+         保留完整原文和译文的换行。数字、价格等无需翻译的内容保持不变。\n本地 OCR 参考块：{}",
+        config.target_language,
+        serde_json::to_string(&references).map_err(|error| error.to_string())?
     );
-    chat_completion(
+    let response = request_chat_completion(
         config,
         serde_json::json!([
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": image_data}}
         ]),
-    )
+    )?;
+    parse_image_translation_response(&response, page)
 }
 
 fn translate_text_with_vision(config: &AppConfig, source: &str) -> Result<String, String> {
@@ -1674,6 +1914,10 @@ fn translate_text_with_vision(config: &AppConfig, source: &str) -> Result<String
 
 /// Sends one user message to the OpenAI-compatible endpoint and parses the JSON reply.
 fn chat_completion(config: &AppConfig, content: Value) -> Result<TranslationResult, String> {
+    parse_translation_response(&request_chat_completion(config, content)?)
+}
+
+fn request_chat_completion(config: &AppConfig, content: Value) -> Result<String, String> {
     let body = serde_json::json!({
         "model": config.model,
         "temperature": 0,
@@ -1700,7 +1944,7 @@ fn chat_completion(config: &AppConfig, content: Value) -> Result<TranslationResu
     if !status.is_success() {
         return Err(format!("接口返回 {}：{}", status, compact_error(&text)));
     }
-    parse_translation_response(&text)
+    Ok(text)
 }
 
 fn validate_image_size(path: &Path) -> Result<(), String> {
@@ -1712,6 +1956,49 @@ fn validate_image_size(path: &Path) -> Result<(), String> {
 }
 
 fn parse_translation_response(text: &str) -> Result<TranslationResult, String> {
+    translation_from_value(&parse_model_response(text)?)
+}
+
+fn parse_image_translation_response(
+    text: &str,
+    mut page: layout::ImageLayout,
+) -> Result<TranslationResult, String> {
+    let mut parsed = parse_model_response(text)?;
+    let blocks = parsed["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| serde_json::from_value::<layout::VisionBlock>(block.clone()).ok());
+    page.apply_vision_blocks(blocks);
+    if parsed["source_text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+        && parsed["original"].as_str().unwrap_or("").trim().is_empty()
+    {
+        parsed["source_text"] = Value::String(page.source_text());
+    }
+    if parsed["translated_text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+        && parsed["translation"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        && page.blocks.iter().any(|block| block.translated.is_some())
+    {
+        parsed["translated_text"] = Value::String(page.translated_text());
+    }
+    let mut result = translation_from_value(&parsed)?;
+    result.layout = Some(Arc::new(page));
+    Ok(result)
+}
+
+fn parse_model_response(text: &str) -> Result<Value, String> {
     let root: Value =
         serde_json::from_str(text).map_err(|error| format!("接口响应不是有效 JSON：{error}"))?;
     let content = root["choices"][0]["message"]["content"]
@@ -1730,6 +2017,13 @@ fn parse_translation_response(text: &str) -> Result<TranslationResult, String> {
             serde_json::from_str(&clean[start..=end]).map_err(|_| ())
         })
         .map_err(|_| "模型返回的内容无法解析为原文和译文。".to_string())?;
+    if !parsed.is_object() {
+        return Err("模型返回的内容无法解析为原文和译文。".into());
+    }
+    Ok(parsed)
+}
+
+fn translation_from_value(parsed: &Value) -> Result<TranslationResult, String> {
     let source = parsed["source_text"]
         .as_str()
         .or_else(|| parsed["original"].as_str())
@@ -2185,8 +2479,21 @@ fn install_system_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result {
+    if !std::env::args().any(|arg| arg == "--ui-child") {
+        return background::run()
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))));
+    }
+    run_ui()
+}
+
+fn run_ui() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_visible(false)
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon_256.png"))
+                    .expect("invalid application icon"),
+            )
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
@@ -2196,7 +2503,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             install_system_fonts(&cc.egui_ctx);
-            Ok(Box::new(OcrTranslateApp::new(&cc.egui_ctx)))
+            Ok(Box::new(OcrTranslateApp::new(cc)))
         }),
     )
 }
@@ -2204,6 +2511,257 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vision_page() -> layout::ImageLayout {
+        layout::ImageLayout {
+            width: 200,
+            height: 100,
+            rgba: [240, 240, 240, 255].repeat(200 * 100),
+            blocks: Vec::new(),
+            dispersed: false,
+        }
+    }
+
+    fn model_response(content: Value) -> String {
+        serde_json::json!({"choices": [{"message": {"content": content.to_string()}}]}).to_string()
+    }
+
+    #[test]
+    fn closing_popup_releases_image_but_keeps_text_and_dictionary() {
+        let page = Arc::new(vision_page());
+        let weak_page = Arc::downgrade(&page);
+        let entry = Arc::new(dictionary::Entry {
+            ..Default::default()
+        });
+        let mut result = TranslationResult {
+            source_text: "Hello world".into(),
+            translated_text: "你好世界".into(),
+            layout: Some(page),
+            dictionary: Some(entry.clone()),
+        };
+        result.release_unused_image(true, false);
+        assert!(
+            weak_page.upgrade().is_some(),
+            "open popup still needs the image"
+        );
+        result.release_unused_image(false, true);
+        assert!(
+            weak_page.upgrade().is_some(),
+            "active request is not cleaned up"
+        );
+        result.release_unused_image(false, false);
+        assert!(
+            weak_page.upgrade().is_none(),
+            "last image allocation was freed"
+        );
+        assert_eq!(result.source_text, "Hello world");
+        assert_eq!(result.translated_text, "你好世界");
+        assert!(Arc::ptr_eq(result.dictionary.as_ref().unwrap(), &entry));
+    }
+
+    #[test]
+    fn text_view_never_allocates_a_texture_and_image_view_reuses_then_frees_it() {
+        let ctx = egui::Context::default();
+        let page = Arc::new(vision_page());
+        let mut popup = popup_at([500, 300]);
+        let size = Some(egui::vec2(100.0, 50.0));
+        let baseline = ctx.tex_manager().read().num_allocated();
+        for _ in 0..20 {
+            popup.image_view = Some(false);
+            popup.prepare_texture(&ctx, Some(&page), size);
+            assert_eq!(ctx.tex_manager().read().num_allocated(), baseline);
+            popup.image_view = Some(true);
+            popup.prepare_texture(&ctx, Some(&page), size);
+            let texture = &popup.texture.as_ref().unwrap().1;
+            assert_eq!(texture.size(), [100, 50]);
+            let id = texture.id();
+            let bytes = ctx.tex_manager().read().meta(id).unwrap().bytes_used();
+            assert_eq!(bytes, 100 * 50 * 4);
+            popup.prepare_texture(&ctx, Some(&page), size);
+            assert_eq!(popup.texture.as_ref().unwrap().1.id(), id);
+            assert_eq!(ctx.tex_manager().read().num_allocated(), baseline + 1);
+            popup.image_view = Some(false);
+            popup.prepare_texture(&ctx, Some(&page), size);
+            assert!(ctx.tex_manager().read().meta(id).is_none());
+        }
+        popup.image_view = Some(true);
+        popup.prepare_texture(&ctx, Some(&page), size);
+        drop(popup);
+        assert_eq!(ctx.tex_manager().read().num_allocated(), baseline);
+    }
+
+    #[test]
+    fn replacing_capture_or_display_size_does_not_accumulate_textures() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        // Apply the requested DPI before preparing textures.
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let baseline = ctx.tex_manager().read().num_allocated();
+        let mut popup = popup_at([500, 300]);
+        popup.image_view = Some(true);
+        for _ in 0..30 {
+            let page = Arc::new(vision_page());
+            let previous_id = popup.texture.as_ref().map(|(_, texture)| texture.id());
+            popup.prepare_texture(&ctx, Some(&page), Some(egui::vec2(50.0, 25.0)));
+            let old_id = popup.texture.as_ref().unwrap().1.id();
+            assert_ne!(previous_id, Some(old_id));
+            assert_eq!(popup.texture.as_ref().unwrap().1.size(), [100, 50]);
+            popup.prepare_texture(&ctx, Some(&page), Some(egui::vec2(100.0, 50.0)));
+            assert_eq!(popup.texture.as_ref().unwrap().1.size(), [200, 100]);
+            assert!(ctx.tex_manager().read().meta(old_id).is_none());
+            assert_eq!(ctx.tex_manager().read().num_allocated(), baseline + 1);
+        }
+        popup.prepare_texture(&ctx, None, None);
+        assert_eq!(ctx.tex_manager().read().num_allocated(), baseline);
+    }
+
+    #[test]
+    fn vision_image_response_maps_blocks_and_derives_missing_full_text() {
+        let response = model_response(serde_json::json!({"blocks": [
+            {"bbox": [100, 200, 400, 300], "source_text": "Hello world", "translated_text": "你好世界"},
+            {"bbox": "bad", "source_text": "Broken", "translated_text": "忽略"}
+        ]}));
+        let result = parse_image_translation_response(&response, vision_page()).unwrap();
+        assert_eq!(result.source_text, "Hello world");
+        assert_eq!(result.translated_text, "你好世界");
+        let page = result.layout.unwrap();
+        assert_eq!(page.blocks.len(), 1);
+        assert_eq!(page.blocks[0].rect, [20.0, 20.0, 80.0, 30.0]);
+    }
+
+    #[test]
+    fn legacy_vision_response_keeps_the_image_and_full_translation() {
+        let response = model_response(serde_json::json!({
+            "original": "Hello world", "translation": "你好世界",
+            "blocks": [{"bbox": [0, 0, 0, 0], "translated_text": "无效位置"}]
+        }));
+        let result = parse_image_translation_response(&response, vision_page()).unwrap();
+        assert_eq!(result.source_text, "Hello world");
+        assert_eq!(result.translated_text, "你好世界");
+        let page = result.layout.unwrap();
+        assert_eq!((page.width, page.height), (200, 100));
+        assert!(page.blocks.is_empty());
+    }
+
+    #[test]
+    fn vision_image_request_uses_one_multimodal_call_without_an_ocr_pack() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            server.local_addr().unwrap()
+        );
+        let response = model_response(serde_json::json!({
+            "source_text": "Hello world", "translated_text": "你好世界",
+            "blocks": [{"bbox": [100, 200, 400, 300], "source_text": "Hello world", "translated_text": "你好世界"}]
+        }));
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (mut stream, _) = loop {
+                match server.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "mock endpoint was not called");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock endpoint failed: {error}"),
+                }
+            };
+            // Accepted sockets can inherit nonblocking mode on Windows.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "test-vision");
+            let content = &request["messages"][0]["content"];
+            assert_eq!(content[0]["type"], "text");
+            assert!(content[0]["text"].as_str().unwrap().contains("bbox"));
+            assert_eq!(content[1]["type"], "image_url");
+            assert!(content[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"));
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        let path = std::env::temp_dir().join(format!("ocr-vision-test-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(200, 100, image::Rgba([240, 240, 240, 255]))
+            .save(&path)
+            .unwrap();
+        let config = AppConfig {
+            mode: TranslationMode::Vision,
+            ocr_language: "invalid-ocr-language".into(),
+            api_url: url,
+            api_key: "test-key".into(),
+            model: "test-vision".into(),
+            ..Default::default()
+        };
+        let result = translate_image(&config, &path);
+        let _ = fs::remove_file(path);
+        worker.join().unwrap();
+        let result = result.unwrap();
+        assert_eq!(result.translated_text, "你好世界");
+        assert_eq!(
+            result.layout.unwrap().blocks[0].rect,
+            [20.0, 20.0, 80.0, 30.0]
+        );
+    }
+
+    #[test]
+    fn translated_image_paints_overlays_and_original_comparison_hides_them() {
+        let response = model_response(serde_json::json!({"blocks": [
+            {"bbox": [100, 200, 400, 300], "source_text": "Hello world", "translated_text": "Translated"}
+        ]}));
+        let page = parse_image_translation_response(&response, vision_page())
+            .unwrap()
+            .layout
+            .unwrap();
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "vision-test",
+            egui::ColorImage::from_rgba_unmultiplied([200, 100], &page.rgba),
+            Default::default(),
+        );
+        let render = |original| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    paint_translated_capture(
+                        ui,
+                        &texture,
+                        &page,
+                        egui::vec2(200.0, 100.0),
+                        original,
+                    );
+                });
+            })
+        };
+        let translated = render(false);
+        assert!(translated.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Translated")));
+        let original = render(true);
+        assert!(!original
+            .shapes
+            .iter()
+            .any(|shape| matches!(&shape.shape, egui::Shape::Text(_))));
+    }
 
     #[test]
     fn parses_structured_translation() {
@@ -2237,6 +2795,31 @@ mod tests {
         assert!(config.volcengine_secret_key.is_empty());
         assert_eq!(config.theme, ThemeMode::Night);
         assert_eq!(config.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(config.close_behavior, CloseBehavior::Tray);
+    }
+
+    #[test]
+    fn close_behavior_survives_protected_config_round_trip() {
+        for behavior in [CloseBehavior::Tray, CloseBehavior::Exit] {
+            let config = AppConfig {
+                close_behavior: behavior,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&config.protected().unwrap()).unwrap();
+            let restored: AppConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.close_behavior, behavior);
+        }
+    }
+
+    #[test]
+    fn removed_ask_behavior_migrates_without_losing_other_settings() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{"close_behavior":"ask","font_size":18,"api_key":"existing-key"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.close_behavior, CloseBehavior::Tray);
+        assert_eq!(config.font_size, 18);
+        assert_eq!(config.api_key, "existing-key");
     }
 
     #[test]
