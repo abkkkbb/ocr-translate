@@ -36,6 +36,25 @@ The configured API receives the selected image. Use a vision-capable model and a
 
 `.cargo/config.toml` links the Visual C++ runtime statically, so `target/release/ocr-translate.exe` runs on its own without the VC++ redistributable. It still needs Windows 10 or 11 with an OCR language pack for the source language, the built-in Snipping Tool for the screen-snip shortcut, and an OpenGL-capable display driver.
 
+## Application icon
+
+The application mark combines mint screenshot-selection corners with white `文` / `A` language glyphs on a navy-to-petrol rounded tile. The 16–24 px variants simplify the lettering for legibility; the tray uses the same simplified mark rendered at 64 px for DPI scaling.
+
+- `assets/icon.svg`: editable, font-independent vector master.
+- `assets/icon.ico`: 13 individually rendered Windows sizes from 16 to 256 px, embedded in the portable exe by `build.rs`.
+- `assets/icon_256.png`: main-window and taskbar icon.
+- `assets/icon_64.png`: small-size-optimized tray icon source.
+- `assets/icon_preview.png`: before/after comparison and actual-size samples on light/dark backgrounds. These are design previews, not screenshots of the running app.
+
+Regenerate the assets with Python and Pillow, then rebuild the exe:
+
+```powershell
+python tools_make_icon.py
+cargo build --release
+```
+
+The generator verifies the ICO directory, exact per-size artwork and transparent corners. Windows Explorer may cache the old exe/shortcut icon; restarting the app updates its runtime icons, while an Explorer refresh or a new shortcut may be needed for the file icon.
+
 ## Run
 
 ```powershell

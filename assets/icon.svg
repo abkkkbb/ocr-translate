@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">OCR Translate</title>
+  <desc id="desc">Mint capture corners framing the Chinese character 文 and a Latin A on a navy-to-petrol rounded tile.</desc>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.5172413793" y2="1.2068965517" gradientUnits="objectBoundingBox">
+      <stop stop-color="#143059"/>
+      <stop offset="1" stop-color="#077384"/>
+    </linearGradient>
+  </defs>
+  <rect x="10" y="10" width="236" height="236" rx="53" fill="url(#tile)"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <polyline points="46,79 46,46 79,46" stroke="#6ef2dc" stroke-width="10"/>
+  <polyline points="177,210 210,210 210,177" stroke="#6ef2dc" stroke-width="10"/>
+  <polyline points="177,46 210,46 210,79" stroke="#6ef2dc" stroke-width="10"/>
+  <polyline points="46,177 46,210 79,210" stroke="#6ef2dc" stroke-width="10"/>
+  <polyline points="94,73 99,81" stroke="#f7fdff" stroke-width="10"/>
+  <polyline points="67,92 126,92" stroke="#f7fdff" stroke-width="10"/>
+  <polyline points="81,98 88,110 98,121 111,131 125,139" stroke="#f7fdff" stroke-width="10"/>
+  <polyline points="115,98 110,110 100,122 86,132 69,140" stroke="#f7fdff" stroke-width="10"/>
+  <polyline points="133,183 154,125 160,125 181,183" stroke="#f7fdff" stroke-width="11"/>
+  <polyline points="142,160 172,160" stroke="#f7fdff" stroke-width="10"/>
+  </g>
+</svg>
