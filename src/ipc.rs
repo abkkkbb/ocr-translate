@@ -20,6 +20,7 @@ pub enum View {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Session {
     pub config: Option<AppConfig>,
     pub result: TranslationResult,
@@ -27,6 +28,7 @@ pub struct Session {
     pub temporary_capture: Option<PathBuf>,
     pub status: String,
     pub anchor: Option<[i32; 2]>,
+    pub task_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,11 +63,16 @@ pub enum Event {
     Lightweight(bool),
     Hotkey(screen_clip::HotkeyEvent),
     Accepted {
+        task_id: u64,
         path: PathBuf,
         popup: bool,
         anchor: [i32; 2],
     },
-    Request(RequestResult),
+    TaskStarted(u64),
+    Request {
+        task_id: u64,
+        result: RequestResult,
+    },
     Quit,
 }
 

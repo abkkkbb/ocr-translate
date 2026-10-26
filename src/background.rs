@@ -3,7 +3,11 @@ use std::{
     io::BufReader,
     os::windows::process::CommandExt,
     process::{Child, Command as ProcessCommand, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
     thread,
 };
 use windows::Win32::{
@@ -30,7 +34,8 @@ fn wake(thread_id: u32) {
 enum Message {
     Command(u64, Command),
     Disconnected(u64),
-    Request(RequestResult),
+    Request(u64, RequestResult),
+    WorkerFinished(std::path::PathBuf, bool),
     Capture(Result<std::path::PathBuf, String>, bool),
 }
 
@@ -39,6 +44,11 @@ struct Ui {
     events: Sender<Event>,
     generation: u64,
     closing: bool,
+}
+
+struct Task {
+    id: u64,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Drop for Ui {
@@ -65,6 +75,9 @@ struct Background {
     config: AppConfig,
     lightweight: bool,
     busy: bool,
+    capture_in_progress: bool,
+    active_task: Option<Task>,
+    next_task_id: u64,
     quitting: bool,
     generation: u64,
     pending_view: Option<View>,
@@ -158,46 +171,75 @@ impl Background {
     }
 
     fn replace_image(&mut self, path: std::path::PathBuf, temporary: bool) {
-        if let Some(previous) = self.session.temporary_capture.take() {
-            if previous != path {
-                let _ = std::fs::remove_file(previous);
-            }
-        }
         self.session.selected_file = Some(path.clone());
         self.session.temporary_capture = temporary.then_some(path);
     }
 
-    fn start_image(&mut self, path: std::path::PathBuf, temporary: bool) {
-        if self.busy {
-            return;
+    fn start_task(&mut self) -> (u64, Arc<AtomicBool>) {
+        if let Some(previous) = self.active_task.take() {
+            previous.cancelled.store(true, Ordering::Release);
+        }
+        self.next_task_id = self.next_task_id.wrapping_add(1).max(1);
+        let task = Task {
+            id: self.next_task_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let worker_token = task.cancelled.clone();
+        let id = task.id;
+        self.active_task = Some(task);
+        self.session.task_id = Some(id);
+        self.update_busy();
+        self.send(Event::TaskStarted(id));
+        (id, worker_token)
+    }
+
+    fn update_busy(&mut self) {
+        self.busy = self.capture_in_progress || self.active_task.is_some();
+        self.hotkey.set_busy(self.capture_in_progress);
+    }
+    fn start_image(&mut self, path: std::path::PathBuf, temporary: bool) -> u64 {
+        if self.capture_in_progress {
+            return self.active_task.as_ref().map_or(0, |task| task.id);
         }
         self.replace_image(path.clone(), temporary);
-        self.busy = true;
-        self.hotkey.set_busy(true);
+        let (task_id, cancelled) = self.start_task();
         self.session.result = TranslationResult::default();
         let config = self.config.clone();
         let sender = self.sender.clone();
         let thread_id = self.thread_id;
         thread::spawn(move || {
+            let source_sender = sender.clone();
+            let send_source = |source: String| {
+                if !cancelled.load(Ordering::Acquire) {
+                    let _ = source_sender
+                        .send(Message::Request(task_id, RequestResult::Source(source)));
+                    wake(thread_id);
+                }
+            };
             let translate = || {
                 if config.mode == crate::TranslationMode::Vision {
-                    return crate::translate_image(&config, &path);
+                    return crate::translate_image_with_progress(&config, &path, |source| {
+                        send_source(source.to_owned());
+                    });
                 }
                 crate::validate_image_size(&path)?;
                 let lines = crate::windows_ocr::recognize_lines(&path, &config.ocr_language)?;
                 let mut page = crate::layout::ImageLayout::build(&path, lines)?;
+                if cancelled.load(Ordering::Acquire) {
+                    return Err("任务已由新的框选替换。".into());
+                }
                 let source = page.source_text();
-                let _ = sender.send(Message::Request(RequestResult::Source(source.clone())));
-                wake(thread_id);
+                send_source(source.clone());
                 let indexes = page.translatable();
                 let texts: Vec<String> = indexes
                     .iter()
                     .map(|&i| page.blocks[i].source.clone())
                     .collect();
-                for (i, translated) in indexes
-                    .into_iter()
-                    .zip(crate::translate_many(&config, &texts)?)
-                {
+                let translations = crate::translate_many_cancellable(&config, &texts, &cancelled)?;
+                if cancelled.load(Ordering::Acquire) {
+                    return Err("任务已由新的框选替换。".into());
+                }
+                for (i, translated) in indexes.into_iter().zip(translations) {
                     page.blocks[i].translated = Some(translated);
                 }
                 Ok(TranslationResult {
@@ -207,48 +249,65 @@ impl Background {
                     dictionary: None,
                 })
             };
-            let result = translate()
-                .map(|result| RequestResult::Success(crate::with_dictionary(&config, result)))
+            let result = translate().and_then(|result| {
+                if cancelled.load(Ordering::Acquire) {
+                    Err("任务已由新的框选替换。".into())
+                } else {
+                    Ok(crate::with_dictionary(&config, result))
+                }
+            });
+            if cancelled.load(Ordering::Acquire) {
+                let _ = sender.send(Message::WorkerFinished(path, temporary));
+                wake(thread_id);
+                return;
+            }
+            let result = result
+                .map(RequestResult::Success)
                 .unwrap_or_else(RequestResult::Error);
-            let _ = sender.send(Message::Request(result));
+            let _ = sender.send(Message::Request(task_id, result));
+            let _ = sender.send(Message::WorkerFinished(path, temporary));
             wake(thread_id);
         });
+        task_id
     }
 
     fn start_text(&mut self, source: String) {
-        if self.busy {
-            return;
-        }
-        self.busy = true;
-        self.hotkey.set_busy(true);
+        let (task_id, cancelled) = self.start_task();
         let config = self.config.clone();
         let sender = self.sender.clone();
         let thread_id = self.thread_id;
         thread::spawn(move || {
-            let result = crate::translate_text(&config, &source)
-                .map(|translated_text| {
-                    RequestResult::Success(crate::with_dictionary(
-                        &config,
-                        TranslationResult {
-                            source_text: source,
-                            translated_text,
-                            layout: None,
-                            dictionary: None,
-                        },
-                    ))
-                })
+            let result = crate::translate_text(&config, &source).and_then(|translated_text| {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err("任务已由新的请求替换。".into());
+                }
+                Ok(crate::with_dictionary(
+                    &config,
+                    TranslationResult {
+                        source_text: source,
+                        translated_text,
+                        layout: None,
+                        dictionary: None,
+                    },
+                ))
+            });
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let result = result
+                .map(RequestResult::Success)
                 .unwrap_or_else(RequestResult::Error);
-            let _ = sender.send(Message::Request(result));
+            let _ = sender.send(Message::Request(task_id, result));
             wake(thread_id);
         });
     }
 
     fn capture(&mut self) {
-        if self.busy {
+        if self.capture_in_progress {
             return;
         }
-        self.busy = true;
-        self.hotkey.set_busy(true);
+        self.capture_in_progress = true;
+        self.update_busy();
         let sender = self.sender.clone();
         let thread_id = self.thread_id;
         thread::spawn(move || {
@@ -260,34 +319,33 @@ impl Background {
     }
 
     fn accepted(&mut self, result: Result<std::path::PathBuf, String>, popup: bool) {
-        self.busy = false;
+        self.capture_in_progress = false;
+        self.update_busy();
         match result {
             Ok(path) => {
                 let anchor = screen_clip::cursor_position();
                 self.session.anchor = Some(anchor);
-                self.replace_image(path.clone(), true);
                 self.session.result = TranslationResult::default();
+                self.session.status = "正在识别并翻译…".into();
+                let task_id = self.start_image(path.clone(), true);
                 if popup {
                     self.report_show(View::Popup);
                 }
                 self.send(Event::Accepted {
-                    path: path.clone(),
+                    task_id,
+                    path,
                     popup,
                     anchor,
                 });
-                self.start_image(path, true);
             }
             Err(error) => {
-                self.hotkey.set_busy(false);
                 self.session.status = error.clone();
-                // Show the view before the outcome event so the UI opens one provisional
-                // popup that the event then adopts, instead of opening two windows.
                 if !popup {
                     self.report_show(View::Main);
                 } else if error != screen_clip::CANCELLED {
                     self.report_show(View::Popup);
                 }
-                self.send(Event::Hotkey(HotkeyEvent::Captured(Err(error.clone()))));
+                self.send(Event::Hotkey(HotkeyEvent::Captured(Err(error))));
             }
         }
     }
@@ -364,11 +422,7 @@ impl Background {
             match action {
                 tray::Action::Open => self.report_show(View::Main),
                 tray::Action::Settings => self.report_show(View::Settings),
-                tray::Action::Capture => {
-                    if !self.busy {
-                        self.capture_popup();
-                    }
-                }
+                tray::Action::Capture => self.capture_popup(),
                 tray::Action::Exit => self.quitting = true,
                 tray::Action::Lightweight => {
                     self.lightweight = !self.lightweight;
@@ -385,7 +439,8 @@ impl Background {
         while let Ok(event) = self.hotkey.events.try_recv() {
             match event {
                 HotkeyEvent::Started => {
-                    self.busy = true;
+                    self.capture_in_progress = true;
+                    self.update_busy();
                     self.send(Event::Hotkey(HotkeyEvent::Started));
                 }
                 HotkeyEvent::Captured(result) => self.accepted(result, true),
@@ -434,38 +489,55 @@ impl Background {
                     }
                 }
                 Message::Capture(result, popup) => self.accepted(result, popup),
-                Message::Request(mut result) => {
+                Message::WorkerFinished(path, temporary) => {
+                    if temporary && self.session.temporary_capture.as_ref() != Some(&path) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                Message::Request(task_id, mut result)
+                    if self
+                        .active_task
+                        .as_ref()
+                        .is_some_and(|task| task.id == task_id) =>
+                {
                     match &mut result {
                         RequestResult::Source(source) => {
-                            self.session.result.source_text = source.clone()
+                            self.session.result.source_text = source.clone();
+                            self.session.status = "识别完成，正在翻译…".into();
                         }
                         RequestResult::Success(result) => {
-                            // The UI reloads pixels from the file; the resident process retains only text.
                             if let Some(page) = result.layout.as_mut() {
                                 std::sync::Arc::make_mut(page).rgba = Vec::new();
                             }
                             self.session.result = result.clone();
                             self.session.status = "翻译完成。".into();
-                            self.busy = false;
+                            self.active_task = None;
+                            self.session.task_id = None;
+                            self.update_busy();
                         }
                         RequestResult::Error(error) => {
                             self.session.status = error.clone();
-                            self.busy = false;
+                            self.active_task = None;
+                            self.session.task_id = None;
+                            self.update_busy();
                         }
                     }
-                    self.hotkey.set_busy(self.busy);
                     if self.ui.is_none() {
                         self.report_show(View::Popup);
                     }
-                    self.send(Event::Request(result));
+                    self.send(Event::Request { task_id, result });
                 }
+                Message::Request(_, _) => {}
             }
         }
     }
 
     fn capture_popup(&mut self) {
-        self.busy = true;
-        self.hotkey.set_busy(true);
+        if self.capture_in_progress {
+            return;
+        }
+        self.capture_in_progress = true;
+        self.update_busy();
         let sender = self.sender.clone();
         let thread_id = self.thread_id;
         thread::spawn(move || {
@@ -506,6 +578,9 @@ pub fn run() -> Result<(), String> {
         config,
         lightweight: false,
         busy: false,
+        capture_in_progress: false,
+        active_task: None,
+        next_task_id: 0,
         quitting: false,
         generation: 0,
         pending_view: None,
@@ -556,6 +631,9 @@ mod tests {
             config: AppConfig::default(),
             lightweight: false,
             busy: false,
+            capture_in_progress: false,
+            active_task: None,
+            next_task_id: 0,
             quitting: false,
             generation: 0,
             pending_view: None,
@@ -574,6 +652,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn starting_a_new_task_cancels_the_previous_task() {
+        let mut app = fixture();
+        let (first_id, first_cancelled) = app.start_task();
+        let (second_id, second_cancelled) = app.start_task();
+        assert_eq!(first_id, 1);
+        assert_eq!(second_id, 2);
+        assert!(first_cancelled.load(Ordering::Acquire));
+        assert!(!second_cancelled.load(Ordering::Acquire));
+        assert_eq!(app.session.task_id, Some(second_id));
+        assert!(app
+            .active_task
+            .as_ref()
+            .is_some_and(|task| task.id == second_id));
+    }
     #[test]
     fn disconnect_without_a_tray_exits_even_while_busy() {
         let mut app = fixture();
@@ -688,9 +781,14 @@ mod tests {
             "must not suspend during capture or translation"
         );
         app.busy = false;
-        app.send(Event::Request(RequestResult::Error(
-            "test task completed".into(),
-        )));
+        app.active_task = Some(Task {
+            id: 1,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        app.send(Event::Request {
+            task_id: 1,
+            result: RequestResult::Error("test task completed".into()),
+        });
         pump_until(&mut app, |app| app.ui.is_none());
         app.show(View::Settings).unwrap();
         assert!(!app.lightweight);
