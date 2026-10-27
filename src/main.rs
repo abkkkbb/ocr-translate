@@ -21,6 +21,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
         Arc, Weak,
     },
@@ -197,6 +198,7 @@ const POPUP_MARGIN: i8 = 14;
 struct ResultPopup {
     /// Unique across the session; gives the viewport its identity.
     id: u64,
+    task_id: Option<u64>,
     /// Where the selection ended and the work area of that monitor, in physical pixels.
     anchor: [i32; 2],
     work_area: [i32; 4],
@@ -208,6 +210,10 @@ struct ResultPopup {
     placed: Option<egui::Rect>,
     width: f32,
     height: f32,
+    /// Physical cursor and window geometry captured at the start of a drag.
+    drag_origin: Option<([i32; 2], egui::Rect)>,
+    /// Physical cursor and window geometry captured at the start of a resize.
+    resize_origin: Option<([i32; 2], egui::Rect)>,
     /// The user dragged or resized this window, so stop placing it at the anchor.
     moved: bool,
     /// The user resized the window away from the content-fitted size.
@@ -228,6 +234,26 @@ struct ResultPopup {
     click_was_down: bool,
     /// Set during drawing when the popup should be gone after this frame.
     close_requested: bool,
+}
+
+#[cfg(test)]
+fn retain_pinned_popups(popups: &mut Vec<ResultPopup>) {
+    popups.retain(|popup| popup.pinned);
+}
+
+fn retain_pinned_and_provisional_popups(popups: &mut Vec<ResultPopup>) {
+    popups.retain(|popup| popup.pinned || popup.provisional);
+}
+
+fn discard_provisional_popups(popups: &mut Vec<ResultPopup>) {
+    popups.retain(|popup| !popup.provisional);
+}
+
+fn restore_popup_result(popup: &mut ResultPopup, result: TranslationResult, status: &str) {
+    popup.provisional = false;
+    popup.pending = false;
+    popup.result = result;
+    popup.status = status.into();
 }
 
 impl ResultPopup {
@@ -291,6 +317,7 @@ impl ResultPopup {
         let anchor = screen_clip::cursor_position();
         Self {
             id,
+            task_id: None,
             anchor,
             work_area: screen_clip::work_area_at(anchor),
             opened_at: Instant::now(),
@@ -300,6 +327,8 @@ impl ResultPopup {
             placed: None,
             width: POPUP_WIDTH,
             height: 120.0,
+            drag_origin: None,
+            resize_origin: None,
             moved: false,
             user_sized: false,
             image_view: None,
@@ -333,6 +362,49 @@ impl ResultPopup {
         )
     }
 
+    fn place_avoiding(&self, size: egui::Vec2, occupied: &[egui::Rect]) -> egui::Pos2 {
+        const GAP: f32 = 12.0;
+        let base = self.place(size);
+        if occupied.is_empty() {
+            return base;
+        }
+        let [left, top, right, bottom] = self.work_area.map(|value| value as f32);
+        let step_x = size.x + GAP;
+        let step_y = size.y + GAP;
+        let rings = (((right - left) / step_x)
+            .max((bottom - top) / step_y)
+            .ceil() as i32)
+            .clamp(1, 64);
+        for ring in 0..=rings {
+            let r = ring as f32;
+            let offsets = [
+                egui::vec2(0.0, r * step_y),
+                egui::vec2(0.0, -r * step_y),
+                egui::vec2(r * step_x, 0.0),
+                egui::vec2(-r * step_x, 0.0),
+                egui::vec2(r * step_x, r * step_y),
+                egui::vec2(-r * step_x, r * step_y),
+                egui::vec2(r * step_x, -r * step_y),
+                egui::vec2(-r * step_x, -r * step_y),
+            ];
+            for offset in offsets {
+                let candidate = base + offset;
+                let corner = egui::pos2(
+                    candidate.x.clamp(left, (right - size.x).max(left)),
+                    candidate.y.clamp(top, (bottom - size.y).max(top)),
+                );
+                let rect = egui::Rect::from_min_size(corner, size);
+                if occupied
+                    .iter()
+                    .all(|other| !rect.intersects(other.expand(GAP / 2.0)))
+                {
+                    return corner;
+                }
+            }
+        }
+        base
+    }
+
     /// Esc, or a click outside every popup once the snip's own mouse release has passed,
     /// closes an unpinned popup. Polled globally because the popup does not take keyboard focus.
     fn dismissed(&mut self, click_inside_any_popup: bool) -> bool {
@@ -355,38 +427,64 @@ impl ResultPopup {
             && !click_inside_any_popup
     }
 
-    /// Move the window by a drag delta in egui points, keeping it on its monitor.
-    fn apply_drag(&mut self, ctx: &egui::Context, delta: egui::Vec2) {
-        let Some(rect) = self.placed else {
+    /// Anchor a move to screen coordinates so moving the window cannot feed back into pointer delta.
+    fn begin_drag(&mut self, cursor: [i32; 2]) {
+        self.drag_origin = self.placed.map(|rect| (cursor, rect));
+        self.moved |= self.drag_origin.is_some();
+    }
+
+    fn apply_drag(&mut self, ctx: &egui::Context, cursor: [i32; 2]) {
+        let Some((origin, start_rect)) = self.drag_origin else {
             return;
         };
         let scale = ctx.pixels_per_point();
         let [left, top, right, bottom] = self.work_area.map(|value| value as f32);
-        let mut corner = rect.min + delta * scale;
-        corner.x = corner.x.clamp(left, (right - rect.width()).max(left));
-        corner.y = corner.y.clamp(top, (bottom - rect.height()).max(top));
-        self.placed = Some(egui::Rect::from_min_size(corner, rect.size()));
-        self.moved = true;
+        let delta = egui::vec2(
+            (cursor[0] - origin[0]) as f32,
+            (cursor[1] - origin[1]) as f32,
+        );
+        let mut corner = start_rect.min + delta;
+        corner.x = corner.x.clamp(left, (right - start_rect.width()).max(left));
+        corner.y = corner.y.clamp(top, (bottom - start_rect.height()).max(top));
+        if self.placed.is_some_and(|rect| rect.min == corner) {
+            return;
+        }
+        self.placed = Some(egui::Rect::from_min_size(corner, start_rect.size()));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             corner.x / scale,
             corner.y / scale,
         )));
     }
 
-    /// Resize the window from its bottom-right grip by a drag delta in egui points.
-    fn apply_resize(&mut self, ctx: &egui::Context, delta: egui::Vec2) {
-        let Some(rect) = self.placed else {
+    /// Resize from the physical cursor origin, keeping the top-left corner fixed.
+    fn begin_resize(&mut self, cursor: [i32; 2]) {
+        self.resize_origin = self.placed.map(|rect| (cursor, rect));
+        self.user_sized |= self.resize_origin.is_some();
+        self.moved |= self.resize_origin.is_some();
+    }
+
+    fn apply_resize(&mut self, ctx: &egui::Context, cursor: [i32; 2]) {
+        let Some((origin, start_rect)) = self.resize_origin else {
             return;
         };
         let scale = ctx.pixels_per_point();
-        let [left, top, right, bottom] = self.work_area.map(|value| value as f32);
+        let [_, _, right, bottom] = self.work_area.map(|value| value as f32);
         let min = egui::vec2(240.0, 140.0) * scale;
-        let max = egui::vec2((right - left).max(min.x), (bottom - top).max(min.y));
-        let size = (rect.size() + delta * scale).clamp(min, max);
-        self.placed = Some(egui::Rect::from_min_size(rect.min, size));
-        self.moved = true;
-        self.user_sized = true;
+        let max = egui::vec2(
+            (right - start_rect.left()).max(min.x),
+            (bottom - start_rect.top()).max(min.y),
+        );
+        let delta = egui::vec2(
+            (cursor[0] - origin[0]) as f32,
+            (cursor[1] - origin[1]) as f32,
+        );
+        let size = (start_rect.size() + delta).clamp(min, max);
+        if self.placed.is_some_and(|rect| rect.size() == size) {
+            return;
+        }
+        self.placed = Some(egui::Rect::from_min_size(start_rect.min, size));
         self.width = size.x / scale;
+        self.height = size.y / scale;
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size / scale));
     }
 
@@ -410,17 +508,20 @@ impl ResultPopup {
         // An invisible drag strip under the header row: registered first so the row's
         // controls stay clickable while the empty space moves the window. It reaches a
         // little past the row; widgets drawn on top keep their own interactions.
-        let strip = egui::Rect::from_min_size(
-            ui.cursor().min,
-            egui::vec2(ui.available_width(), 28.0),
-        );
+        let strip =
+            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 28.0));
         let drag = ui.interact(strip, ui.id().with("title_drag"), egui::Sense::drag());
         if drag.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
-        let drag_delta = drag.drag_delta();
-        if drag.dragged() && drag_delta != egui::Vec2::ZERO {
-            self.apply_drag(ui.ctx(), drag_delta);
+        if drag.drag_started_by(egui::PointerButton::Primary) {
+            self.begin_drag(screen_clip::cursor_position());
+        }
+        if drag.dragged() {
+            self.apply_drag(ui.ctx(), screen_clip::cursor_position());
+        }
+        if drag.drag_stopped_by(egui::PointerButton::Primary) {
+            self.drag_origin = None;
         }
         ui.horizontal(|ui| {
             if pending {
@@ -466,8 +567,7 @@ impl ResultPopup {
         ui.add_space(4.0);
 
         self.prepare_texture(ui.ctx(), layout.as_ref().filter(|_| !pending), image_size);
-        if let (Some(size), Some(page), Some((_, texture))) = (image_size, &layout, &self.texture)
-        {
+        if let (Some(size), Some(page), Some((_, texture))) = (image_size, &layout, &self.texture) {
             paint_translated_capture(ui, texture, page, size, self.show_source);
             if !self.show_source
                 && !translated.is_empty()
@@ -479,7 +579,9 @@ impl ResultPopup {
                     .max_height(120.0)
                     .show(ui, |ui| {
                         ui.add(
-                            egui::Label::new(translated.as_str()).wrap().selectable(true),
+                            egui::Label::new(translated.as_str())
+                                .wrap()
+                                .selectable(true),
                         );
                     });
             }
@@ -518,13 +620,22 @@ impl ResultPopup {
                         draw_dictionary(ui, palette, entry);
                     }
                 } else if pending {
-                    ui.label(RichText::new("正在识别并翻译…").color(palette.muted));
+                    if source.is_empty() {
+                        ui.label(RichText::new(&self.status).color(palette.muted));
+                    } else {
+                        ui.label(RichText::new("识别原文").small().color(palette.muted));
+                        ui.add(
+                            egui::Label::new(RichText::new(source.as_str()).color(palette.text))
+                                .wrap()
+                                .selectable(true),
+                        );
+                    }
                 } else {
                     ui.add(
                         egui::Label::new(RichText::new(&self.status).color(palette.danger)).wrap(),
                     );
                 }
-                if self.show_source && !source.is_empty() {
+                if !pending && self.show_source && !source.is_empty() {
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add(
@@ -568,9 +679,14 @@ impl ResultPopup {
                         Stroke::new(1.0_f32, palette.border),
                     );
                 }
-                let resize_delta = grip.drag_delta();
-                if grip.dragged() && resize_delta != egui::Vec2::ZERO {
-                    self.apply_resize(ui.ctx(), resize_delta);
+                if grip.drag_started_by(egui::PointerButton::Primary) {
+                    self.begin_resize(screen_clip::cursor_position());
+                }
+                if grip.dragged() {
+                    self.apply_resize(ui.ctx(), screen_clip::cursor_position());
+                }
+                if grip.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.resize_origin = None;
                 }
             });
         });
@@ -615,6 +731,7 @@ struct OcrTranslateApp {
     result: TranslationResult,
     selected_file: Option<PathBuf>,
     temporary_capture: Option<PathBuf>,
+    active_task_id: Option<u64>,
     request_rx: Option<Receiver<RequestResult>>,
     capture_rx: Option<Receiver<Result<PathBuf, String>>>,
     active_hotkey: Option<screen_clip::Hotkey>,
@@ -666,6 +783,7 @@ impl OcrTranslateApp {
             result: TranslationResult::default(),
             selected_file: None,
             temporary_capture: None,
+            active_task_id: None,
             request_rx: None,
             capture_rx: None,
             active_hotkey: None,
@@ -696,8 +814,12 @@ impl OcrTranslateApp {
         app
     }
 
+    fn capture_busy(&self) -> bool {
+        self.capture_rx.is_some() || self.hotkey_capture_active
+    }
+
     fn busy(&self) -> bool {
-        self.request_rx.is_some() || self.capture_rx.is_some() || self.hotkey_capture_active
+        self.request_rx.is_some() || self.capture_busy()
     }
 
     /// Add a new result popup at the current cursor, or at `anchor` when the capture
@@ -796,6 +918,7 @@ impl OcrTranslateApp {
                     self.shortcut_draft =
                         screen_clip::Hotkey::parse(&self.config.shortcut).unwrap_or_default();
                     self.active_hotkey = active_hotkey;
+                    self.active_task_id = session.task_id;
                     self.result = session.result;
                     self.selected_file = session.selected_file;
                     self.temporary_capture = session.temporary_capture;
@@ -810,11 +933,19 @@ impl OcrTranslateApp {
                         popup.anchor = anchor;
                         popup.work_area = screen_clip::work_area_at(anchor);
                     }
+                    if !busy && matches!(view, ipc::View::Popup) {
+                        if let Some(popup) =
+                            self.popups.last_mut().filter(|popup| popup.provisional)
+                        {
+                            restore_popup_result(popup, self.result.clone(), &self.status);
+                        }
+                    }
                     if busy {
                         let (_tx, rx) = mpsc::channel();
                         self.request_rx = Some(rx);
                         for popup in &mut self.popups {
                             popup.pending = true;
+                            popup.task_id = self.active_task_id;
                         }
                     }
                 }
@@ -827,11 +958,16 @@ impl OcrTranslateApp {
                     self.lightweight = enabled;
                 }
                 ipc::Event::Hotkey(event) => self.handle_hotkey(event),
+                ipc::Event::TaskStarted(task_id) => {
+                    self.active_task_id = Some(task_id);
+                }
                 ipc::Event::Accepted {
+                    task_id,
                     path,
                     popup,
                     anchor,
                 } => {
+                    self.active_task_id = Some(task_id);
                     self.hotkey_capture_active = false;
                     self.capture_rx = None;
                     self.selected_file = Some(path.clone());
@@ -839,60 +975,76 @@ impl OcrTranslateApp {
                     self.begin_remote_request();
                     self.status = "正在识别并翻译…".into();
                     if popup {
-                        match self.popups.last_mut() {
-                            // The provisional window opened for this capture; adopt it.
-                            Some(popup) if popup.provisional => {
+                        retain_pinned_and_provisional_popups(&mut self.popups);
+                        match self.popups.iter_mut().rev().find(|popup| popup.provisional) {
+                            Some(popup) => {
+                                popup.task_id = Some(task_id);
                                 popup.anchor = anchor;
                                 popup.work_area = screen_clip::work_area_at(anchor);
                                 popup.pending = true;
                                 popup.provisional = false;
                                 popup.status = self.status.clone();
                             }
-                            _ => self.spawn_popup(Some(anchor), true, false),
+                            None => {
+                                self.spawn_popup(Some(anchor), true, false);
+                                if let Some(popup) = self.popups.last_mut() {
+                                    popup.task_id = Some(task_id);
+                                }
+                            }
                         }
                     } else {
                         self.reveal_main_window(ctx);
                     }
                 }
-                ipc::Event::Request(message) => match message {
-                    RequestResult::Source(source) => {
-                        self.result.source_text = source.clone();
-                        self.status = "识别完成，正在翻译…".into();
-                        for popup in self.popups.iter_mut().filter(|popup| popup.pending) {
-                            popup.result.source_text = source.clone();
-                            popup.status = self.status.clone();
+                ipc::Event::Request { task_id, result } if self.active_task_id == Some(task_id) => {
+                    match result {
+                        RequestResult::Source(source) => {
+                            self.result.source_text = source.clone();
+                            self.status = "识别完成，正在翻译…".into();
+                            for popup in self
+                                .popups
+                                .iter_mut()
+                                .filter(|popup| popup.task_id == Some(task_id) && popup.pending)
+                            {
+                                popup.result.source_text = source.clone();
+                                popup.status = self.status.clone();
+                            }
+                        }
+                        RequestResult::Success(result) => {
+                            self.request_rx = None;
+                            self.capture_rx = None;
+                            self.result = result;
+                            self.restore_pixels();
+                            self.status = "翻译完成。".into();
+                            if let Some(popup) = self
+                                .popups
+                                .iter_mut()
+                                .find(|popup| popup.task_id == Some(task_id))
+                            {
+                                popup.pending = false;
+                                popup.provisional = false;
+                                popup.result = self.result.clone();
+                                popup.status = self.status.clone();
+                            }
+                            self.active_task_id = None;
+                        }
+                        RequestResult::Error(error) => {
+                            self.request_rx = None;
+                            self.status = error.clone();
+                            if let Some(popup) = self
+                                .popups
+                                .iter_mut()
+                                .find(|popup| popup.task_id == Some(task_id))
+                            {
+                                popup.pending = false;
+                                popup.provisional = false;
+                                popup.status = error;
+                            }
+                            self.active_task_id = None;
                         }
                     }
-                    RequestResult::Success(result) => {
-                        self.request_rx = None;
-                        self.capture_rx = None;
-                        self.hotkey_capture_active = false;
-                        self.result = result;
-                        self.restore_pixels();
-                        self.status = "翻译完成。".into();
-                        if let Some(popup) =
-                            self.popups.iter_mut().rev().find(|popup| popup.pending)
-                        {
-                            popup.pending = false;
-                            popup.provisional = false;
-                            popup.result = self.result.clone();
-                            popup.status = self.status.clone();
-                        }
-                    }
-                    RequestResult::Error(error) => {
-                        self.request_rx = None;
-                        self.capture_rx = None;
-                        self.hotkey_capture_active = false;
-                        self.status = error.clone();
-                        if let Some(popup) =
-                            self.popups.iter_mut().rev().find(|popup| popup.pending)
-                        {
-                            popup.pending = false;
-                            popup.provisional = false;
-                            popup.status = error;
-                        }
-                    }
-                },
+                }
+                ipc::Event::Request { .. } => {}
                 ipc::Event::Quit => {
                     self.exit_requested = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -913,6 +1065,7 @@ impl OcrTranslateApp {
                 temporary_capture: self.temporary_capture.clone(),
                 status: self.status.clone(),
                 anchor: None,
+                task_id: self.active_task_id,
             };
             if let Err(error) = self.client.send(ipc::Command::Suspend(Box::new(session))) {
                 self.status = error;
@@ -977,7 +1130,7 @@ impl OcrTranslateApp {
     }
 
     fn start_screen_capture(&mut self, ctx: &egui::Context) {
-        if self.busy() {
+        if self.capture_busy() {
             return;
         }
         self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
@@ -1002,16 +1155,10 @@ impl OcrTranslateApp {
                 }
             }
             screen_clip::HotkeyEvent::Busy => {
-                self.status = "上一项截图或翻译还在进行，请完成后再按快捷键。".into();
-                if !self.popups.iter().any(|popup| popup.pending) {
-                    self.spawn_popup(None, true, true);
-                }
+                self.status = "截图选择器仍在运行，请先完成或取消当前框选。".into();
             }
             screen_clip::HotkeyEvent::Started => {
                 self.hotkey_capture_active = true;
-                // Pinned popups stay on screen across captures; the rest close now or on
-                // the capture's first click outside.
-                self.popups.retain(|popup| popup.pinned);
                 self.status = "请在屏幕上拖动鼠标，框选需要翻译的区域。按 Esc 取消。".into();
             }
             screen_clip::HotkeyEvent::Captured(Ok(path)) => {
@@ -1019,7 +1166,9 @@ impl OcrTranslateApp {
             }
             screen_clip::HotkeyEvent::Captured(Err(error)) => {
                 self.hotkey_capture_active = false;
-                if error != screen_clip::CANCELLED {
+                if error == screen_clip::CANCELLED {
+                    discard_provisional_popups(&mut self.popups);
+                } else {
                     self.status = error.clone();
                     match self.popups.last_mut() {
                         Some(popup) if popup.provisional => {
@@ -1568,9 +1717,10 @@ impl OcrTranslateApp {
     fn draw_result(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let palette = Palette::of(self.config.theme);
         let idle = !self.busy();
+        let capture_idle = !self.capture_busy();
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(idle, primary_button(&palette, "框选屏幕"))
+                .add_enabled(capture_idle, primary_button(&palette, "框选屏幕"))
                 .on_hover_text(format!("快捷键：{}", self.shortcut_label()))
                 .clicked()
             {
@@ -1684,8 +1834,14 @@ impl OcrTranslateApp {
         let click_inside_any = popups
             .iter()
             .any(|popup| popup.placed.is_some_and(|rect| rect.contains(cursor)));
-        for popup in popups.iter_mut() {
-            self.show_one_popup(ctx, popup, click_inside_any);
+        for index in 0..popups.len() {
+            let occupied: Vec<_> = popups
+                .iter()
+                .enumerate()
+                .filter(|(other_index, _)| *other_index != index)
+                .filter_map(|(_, popup)| popup.placed)
+                .collect();
+            self.show_one_popup(ctx, &mut popups[index], click_inside_any, &occupied);
         }
         popups.retain(|popup| !popup.close_requested);
         if popups.iter().any(|popup| !popup.pinned) {
@@ -1700,6 +1856,7 @@ impl OcrTranslateApp {
         ctx: &egui::Context,
         popup: &mut ResultPopup,
         click_inside_any: bool,
+        occupied: &[egui::Rect],
     ) {
         if popup.dismissed(click_inside_any) {
             // Not showing the viewport this frame closes its window.
@@ -1746,83 +1903,106 @@ impl OcrTranslateApp {
                 _ => POPUP_WIDTH,
             };
         }
-        let max_height = if image_view {
-            (bottom - top) * 0.9
-        } else {
-            POPUP_MAX_HEIGHT
-        };
         let width = popup.width;
-        let initial = popup.place(egui::vec2(width, popup.height) * root_scale);
-        let builder = egui::ViewportBuilder::default()
+        let first_placement = popup.placed.is_none();
+        let initial = popup.place_avoiding(egui::vec2(width, popup.height) * root_scale, occupied);
+        let mut builder = egui::ViewportBuilder::default()
             .with_title("OCR Translate 译文")
             .with_decorations(false)
             .with_resizable(false)
             .with_always_on_top()
             .with_taskbar(false)
-            .with_active(false)
-            .with_inner_size([width, popup.height])
-            .with_position([initial.x / root_scale, initial.y / root_scale]);
+            .with_active(false);
+        if first_placement {
+            builder = builder
+                .with_inner_size([width, popup.height])
+                .with_position([initial.x / root_scale, initial.y / root_scale]);
+        }
         let id = egui::ViewportId::from_hash_of(egui::Id::new(("result_popup", popup.id)));
         let mut close = false;
         let mut open_main_window = false;
-        ctx.show_viewport_immediate(
-            id,
-            builder,
-            |ctx, _| {
-                let content_height = egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .fill(palette.surface)
-                            .stroke(Stroke::new(1.0_f32, palette.border))
-                            .inner_margin(POPUP_MARGIN),
-                    )
-                    .show(ctx, |ui| {
-                        ui.scope(|ui| {
-                            popup.draw(
-                                ui,
-                                &palette,
-                                image_size,
-                                &mut close,
-                                &mut open_main_window,
-                            )
-                        })
-                        .response
-                        .rect
-                        .height()
+        ctx.show_viewport_immediate(id, builder, |ctx, _| {
+            let scale = ctx.pixels_per_point();
+            let [left, top, right, bottom] = popup.work_area.map(|value| value as f32 / scale);
+            let window_points = popup.placed.map(|rect| rect.size() / scale);
+            let image_size = page.as_ref().map(|page| {
+                let natural = egui::vec2(page.width as f32, page.height as f32) / scale;
+                if popup.user_sized {
+                    let avail = egui::vec2(
+                        (popup.width - 2.0 * f32::from(POPUP_MARGIN)).max(60.0),
+                        (window_points.map_or(240.0, |size| size.y)
+                            - 2.0 * f32::from(POPUP_MARGIN)
+                            - 70.0)
+                            .max(60.0),
+                    );
+                    natural * (avail.x / natural.x).min(avail.y / natural.y)
+                } else {
+                    let limit = egui::vec2((right - left) * 0.66, (bottom - top) * 0.75 - 80.0);
+                    natural * (limit.x / natural.x).min(limit.y / natural.y).min(1.0)
+                }
+            });
+            if !popup.user_sized {
+                popup.width = match image_size {
+                    Some(size) if image_view => {
+                        (size.x + 2.0 * f32::from(POPUP_MARGIN)).max(POPUP_WIDTH)
+                    }
+                    _ => POPUP_WIDTH,
+                };
+            }
+            let width = popup.width;
+            let max_height = if image_view {
+                (bottom - top) * 0.9
+            } else {
+                POPUP_MAX_HEIGHT
+            };
+            let content_height = egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(palette.surface)
+                        .stroke(Stroke::new(1.0_f32, palette.border))
+                        .inner_margin(POPUP_MARGIN),
+                )
+                .show(ctx, |ui| {
+                    ui.scope(|ui| {
+                        popup.draw(ui, &palette, image_size, &mut close, &mut open_main_window)
                     })
-                    .inner;
+                    .response
+                    .rect
+                    .height()
+                })
+                .inner;
 
-                // Fit the window to its content unless the user took over its geometry.
-                let scale = ctx.pixels_per_point();
-                let height =
-                    (content_height + 2.0 * f32::from(POPUP_MARGIN)).clamp(80.0, max_height);
-                let size = if popup.user_sized {
-                    popup
-                        .placed
-                        .map_or(egui::vec2(width, height) * scale, |rect| rect.size())
-                } else {
-                    egui::vec2(width, height) * scale
-                };
-                let corner = if popup.moved {
-                    popup.placed.map_or(popup.place(size), |rect| rect.min)
-                } else {
-                    popup.place(size)
-                };
-                let rect = egui::Rect::from_min_size(corner, size);
-                if popup.placed != Some(rect) {
-                    popup.placed = Some(rect);
-                    popup.height = height;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size / scale));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                        corner.x / scale,
-                        corner.y / scale,
-                    )));
-                }
-                if ctx.input(|input| input.viewport().close_requested()) {
-                    close = true;
-                }
-            },
-        );
+            // Fit the window to its content unless the user took over its geometry.
+            let height = (content_height + 2.0 * f32::from(POPUP_MARGIN)).clamp(80.0, max_height);
+            let size = if popup.user_sized {
+                popup
+                    .placed
+                    .map_or(egui::vec2(width, height) * scale, |rect| rect.size())
+            } else {
+                egui::vec2(width, height) * scale
+            };
+            let corner = if popup.moved {
+                popup
+                    .placed
+                    .map_or(popup.place_avoiding(size, occupied), |rect| rect.min)
+            } else {
+                popup.place_avoiding(size, occupied)
+            };
+            let rect = egui::Rect::from_min_size(corner, size);
+            if popup.placed != Some(rect) {
+                popup.placed = Some(rect);
+                popup.width = size.x / scale;
+                popup.height = size.y / scale;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size / scale));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    corner.x / scale,
+                    corner.y / scale,
+                )));
+            }
+            if ctx.input(|input| input.viewport().close_requested()) {
+                close = true;
+            }
+        });
         if open_main_window {
             self.lightweight = false;
             let _ = self.client.send(ipc::Command::Open(ipc::View::Main));
@@ -1970,22 +2150,40 @@ fn volcengine_credentials(config: &AppConfig) -> (String, String) {
 }
 
 /// Translates each text separately, returning one translation per input in order.
-fn translate_many(config: &AppConfig, texts: &[String]) -> Result<Vec<String>, String> {
+fn translate_many_cancellable(
+    config: &AppConfig,
+    texts: &[String],
+    cancelled: &AtomicBool,
+) -> Result<Vec<String>, String> {
+    let check_cancelled = || {
+        if cancelled.load(Ordering::Acquire) {
+            Err("任务已被新的请求替换。".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     match config.mode {
         TranslationMode::Volcengine => {
             let target = free_translate::target_code(&config.target_language, config.mode)?;
             let (access_key, secret_key) = volcengine_credentials(config);
-            volcengine::translate_list(texts, target, &access_key, &secret_key)
+            let result = volcengine::translate_list(texts, target, &access_key, &secret_key)?;
+            check_cancelled()?;
+            Ok(result)
         }
-        TranslationMode::Vision => texts
-            .iter()
-            .map(|text| translate_text(config, text))
-            .collect(),
+        TranslationMode::Vision => {
+            let mut translations = Vec::with_capacity(texts.len());
+            for text in texts {
+                check_cancelled()?;
+                translations.push(translate_text(config, text)?);
+            }
+            Ok(translations)
+        }
         TranslationMode::Tencent | TranslationMode::Google => {
-            // Send a few lines per request, keeping URL-based providers under their size limit.
             let mut translations = Vec::with_capacity(texts.len());
             let mut start = 0;
             while start < texts.len() {
+                check_cancelled()?;
                 let mut end = start + 1;
                 let mut length = texts[start].len();
                 while end < texts.len() && length + texts[end].len() < 1500 {
@@ -1993,6 +2191,7 @@ fn translate_many(config: &AppConfig, texts: &[String]) -> Result<Vec<String>, S
                     end += 1;
                 }
                 translations.extend(translate_lines(config, &texts[start..end])?);
+                check_cancelled()?;
                 start = end;
             }
             Ok(translations)
@@ -2064,11 +2263,21 @@ fn translate_text(config: &AppConfig, source: &str) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
 fn translate_image(config: &AppConfig, path: &Path) -> Result<TranslationResult, String> {
+    translate_image_with_progress(config, path, |_| {})
+}
+
+fn translate_image_with_progress(
+    config: &AppConfig,
+    path: &Path,
+    on_source: impl Fn(&str),
+) -> Result<TranslationResult, String> {
     validate_image_size(path)?;
     // Position hints improve placement, but vision translation also works without an OCR pack.
     let lines = windows_ocr::recognize_lines(path, &config.ocr_language).unwrap_or_default();
     let page = layout::ImageLayout::build(path, lines)?;
+    on_source(&page.source_text());
     let references: Vec<Value> = page
         .translatable()
         .into_iter()
@@ -3088,6 +3297,7 @@ mod tests {
     fn popup_at(anchor: [i32; 2]) -> ResultPopup {
         ResultPopup {
             id: 1,
+            task_id: None,
             anchor,
             work_area: [0, 0, 1920, 1040],
             opened_at: Instant::now(),
@@ -3097,6 +3307,8 @@ mod tests {
             placed: None,
             width: POPUP_WIDTH,
             height: 120.0,
+            drag_origin: None,
+            resize_origin: None,
             moved: false,
             user_sized: false,
             image_view: None,
@@ -3133,30 +3345,95 @@ mod tests {
     }
 
     #[test]
-    fn dragging_moves_the_window_and_keeps_it_on_its_monitor() {
-        let ctx = egui::Context::default();
-        let mut popup = placed_popup([500, 300]);
-        popup.apply_drag(&ctx, egui::vec2(40.0, 20.0));
-        let rect = popup.placed.unwrap();
-        assert_eq!(rect.min, egui::pos2(540.0, 320.0));
-        assert!(popup.moved);
-
-        // A drag that would leave the monitor clamps to its work area.
-        popup.apply_drag(&ctx, egui::vec2(5000.0, -2000.0));
-        let rect = popup.placed.unwrap();
-        assert_eq!(rect.min, egui::pos2(1540.0, 0.0));
+    fn new_result_popup_avoids_a_pinned_popup_at_the_same_capture_anchor() {
+        let mut pinned = placed_popup([500, 300]);
+        pinned.pinned = true;
+        pinned.placed = Some(egui::Rect::from_min_size(
+            egui::pos2(516.0, 316.0),
+            egui::vec2(400.0, 200.0),
+        ));
+        let existing = pinned.placed.unwrap();
+        let next = popup_at([500, 300]);
+        let corner = next.place_avoiding(egui::vec2(400.0, 200.0), &[existing]);
+        let result = egui::Rect::from_min_size(corner, egui::vec2(400.0, 200.0));
+        assert!(!result.intersects(existing.expand(6.0)));
+        assert!(corner.x >= 0.0 && corner.y >= 0.0);
+        assert!(result.right() <= 1920.0 && result.bottom() <= 1040.0);
     }
 
     #[test]
-    fn resizing_from_the_grip_is_clamped_to_sane_sizes() {
+    fn capture_start_keeps_pinned_popups_and_cancel_removes_only_provisionals() {
+        let mut pinned = placed_popup([500, 300]);
+        pinned.id = 1;
+        pinned.pinned = true;
+        let mut provisional = placed_popup([500, 300]);
+        provisional.id = 2;
+        provisional.provisional = true;
+        let mut popups = vec![pinned, provisional];
+
+        retain_pinned_popups(&mut popups);
+        assert_eq!(popups.len(), 1);
+        assert_eq!(popups[0].id, 1);
+        assert!(popups[0].pinned);
+
+        let mut pending = placed_popup([500, 300]);
+        pending.id = 3;
+        pending.provisional = true;
+        popups.push(pending);
+        discard_provisional_popups(&mut popups);
+        assert_eq!(popups.len(), 1);
+        assert_eq!(popups[0].id, 1);
+    }
+
+    #[test]
+    fn restored_popup_adopts_the_completed_session_result() {
+        let mut popup = popup_at([500, 300]);
+        popup.pending = true;
+        popup.provisional = true;
+        restore_popup_result(
+            &mut popup,
+            TranslationResult {
+                source_text: "source".into(),
+                translated_text: "translation".into(),
+                ..Default::default()
+            },
+            "翻译完成。",
+        );
+        assert!(!popup.pending && !popup.provisional);
+        assert_eq!(popup.result.source_text, "source");
+        assert_eq!(popup.result.translated_text, "translation");
+    }
+
+    #[test]
+    fn dragging_uses_absolute_screen_cursor_and_keeps_its_monitor_bounds() {
         let ctx = egui::Context::default();
         let mut popup = placed_popup([500, 300]);
-        popup.apply_resize(&ctx, egui::vec2(-5000.0, -5000.0));
-        assert_eq!(popup.placed.unwrap().size(), egui::vec2(240.0, 140.0));
+        popup.begin_drag([100, 100]);
+        popup.apply_drag(&ctx, [140, 120]);
+        assert_eq!(popup.placed.unwrap().min, egui::pos2(540.0, 320.0));
 
-        popup.apply_resize(&ctx, egui::vec2(5000.0, 5000.0));
-        assert_eq!(popup.placed.unwrap().size(), egui::vec2(1920.0, 1040.0));
-        assert!(popup.user_sized);
-        assert!((popup.width - 1920.0).abs() < 0.01);
+        // Repeated coordinates after a window move cannot accumulate or bounce it back.
+        popup.apply_drag(&ctx, [140, 120]);
+        assert_eq!(popup.placed.unwrap().min, egui::pos2(540.0, 320.0));
+        popup.apply_drag(&ctx, [150, 125]);
+        assert_eq!(popup.placed.unwrap().min, egui::pos2(550.0, 325.0));
+        assert!(popup.moved);
+
+        popup.apply_drag(&ctx, [10000, -10000]);
+        assert_eq!(popup.placed.unwrap().min, egui::pos2(1540.0, 0.0));
+    }
+
+    #[test]
+    fn resizing_uses_absolute_cursor_and_updates_both_builder_dimensions() {
+        let ctx = egui::Context::default();
+        let mut popup = placed_popup([500, 300]);
+        popup.begin_resize([100, 100]);
+        popup.apply_resize(&ctx, [-5000, -5000]);
+        assert_eq!(popup.placed.unwrap().size(), egui::vec2(240.0, 140.0));
+        assert_eq!((popup.width, popup.height), (240.0, 140.0));
+
+        popup.apply_resize(&ctx, [5100, 5100]);
+        assert_eq!(popup.placed.unwrap().size(), egui::vec2(1420.0, 740.0));
+        assert_eq!((popup.width, popup.height), (1420.0, 740.0));
     }
 }
