@@ -1,0 +1,29 @@
+# Builds the Windows exe on GitHub's machines. Start it from the Actions tab with "Run workflow",
+# then download the exe from the run's Artifacts section.
+name: Build exe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Reuses compiled dependencies from earlier runs, so later builds are much faster.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ocr-translate-${{ github.run_number }}
+          path: target/release/ocr-translate.exe
+          if-no-files-found: error
