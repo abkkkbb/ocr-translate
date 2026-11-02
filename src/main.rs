@@ -4,12 +4,14 @@ mod background;
 mod dictionary;
 mod free_translate;
 mod ipc;
+mod language;
 mod layout;
 mod net;
 mod screen_clip;
 mod secret_store;
 mod single_instance;
 mod tray;
+mod tts;
 mod volcengine;
 mod windows_ocr;
 
@@ -30,6 +32,8 @@ use std::{
 };
 
 const CONFIG_FILE: &str = "config.json";
+const OFFICIAL_WEBSITE: &str = "https://github.com/abkkkbb/ocr-translate";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const DEFAULT_FONT_SIZE: u8 = 13;
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<u8> = 12..=22;
@@ -113,11 +117,19 @@ struct AppConfig {
     api_key: String,
     model: String,
     target_language: String,
+    /// Translate text already in the target language into `second_language` instead.
+    two_way: bool,
+    second_language: String,
     shortcut: String,
     proxy_mode: net::ProxyMode,
     proxy_url: String,
     volcengine_access_key: String,
     volcengine_secret_key: String,
+    tts_engine: tts::Engine,
+    /// Speaking speed for read-aloud; 1.0 is normal.
+    tts_rate: f32,
+    azure_speech_key: String,
+    azure_speech_region: String,
 }
 
 impl Default for AppConfig {
@@ -132,11 +144,17 @@ impl Default for AppConfig {
             api_key: String::new(),
             model: "gpt-4o-mini".into(),
             target_language: "简体中文".into(),
+            two_way: true,
+            second_language: "英语".into(),
             shortcut: "Ctrl+Shift+T".into(),
             proxy_mode: net::ProxyMode::System,
             proxy_url: "http://127.0.0.1:7890".into(),
             volcengine_access_key: String::new(),
             volcengine_secret_key: String::new(),
+            tts_engine: tts::Engine::Windows,
+            tts_rate: 1.0,
+            azure_speech_key: String::new(),
+            azure_speech_region: "eastasia".into(),
         }
     }
 }
@@ -149,11 +167,12 @@ impl AppConfig {
         }
     }
 
-    fn secrets_mut(&mut self) -> [&mut String; 3] {
+    fn secrets_mut(&mut self) -> [&mut String; 4] {
         [
             &mut self.api_key,
             &mut self.volcengine_access_key,
             &mut self.volcengine_secret_key,
+            &mut self.azure_speech_key,
         ]
     }
 
@@ -234,6 +253,31 @@ struct ResultPopup {
     click_was_down: bool,
     /// Set during drawing when the popup should be gone after this frame.
     close_requested: bool,
+}
+
+/// What the user asked of a popup while it was drawn this frame.
+#[derive(Default)]
+struct PopupActions {
+    close: bool,
+    open_main_window: bool,
+    toggle_speech: Option<tts::Part>,
+}
+
+/// Read-aloud state of a popup's two texts.
+struct PopupSpeech {
+    translation: tts::Status,
+    source: tts::Status,
+}
+
+impl PopupSpeech {
+    fn error(&self) -> Option<&str> {
+        [&self.translation, &self.source]
+            .into_iter()
+            .find_map(|status| match status {
+                tts::Status::Failed(error) => Some(error.as_str()),
+                _ => None,
+            })
+    }
 }
 
 #[cfg(test)]
@@ -494,8 +538,8 @@ impl ResultPopup {
         ui: &mut egui::Ui,
         palette: &Palette,
         image_size: Option<egui::Vec2>,
-        close: &mut bool,
-        open_main_window: &mut bool,
+        speech: &PopupSpeech,
+        actions: &mut PopupActions,
     ) {
         let translated = self.result.translated_text.trim().to_owned();
         let source = self.result.source_text.trim().to_owned();
@@ -504,6 +548,16 @@ impl ResultPopup {
         let action = |ui: &mut egui::Ui, text: &str, color: Color32| {
             ui.add(egui::Button::new(RichText::new(text).small().color(color)).frame(false))
                 .clicked()
+        };
+        let speak_source = |ui: &mut egui::Ui, actions: &mut PopupActions| {
+            let (label, color) = match speech.source {
+                tts::Status::Active => ("停止朗读", palette.accent),
+                tts::Status::Failed(_) => ("朗读原文", palette.danger),
+                tts::Status::Idle => ("朗读原文", palette.accent),
+            };
+            if action(ui, label, color) {
+                actions.toggle_speech = Some(tts::Part::Source);
+            }
         };
         // An invisible drag strip under the header row: registered first so the row's
         // controls stay clickable while the empty space moves the window. It reaches a
@@ -542,13 +596,21 @@ impl ResultPopup {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if action(ui, "关闭", palette.muted) {
-                    *close = true;
+                    actions.close = true;
                 }
                 if !translated.is_empty() {
                     let label = if self.copied { "已复制" } else { "复制" };
                     if action(ui, label, palette.accent) {
                         ui.ctx().copy_text(translated.clone());
                         self.copied = true;
+                    }
+                    let (label, color) = match speech.translation {
+                        tts::Status::Active => ("停止", palette.accent),
+                        tts::Status::Failed(_) => ("朗读", palette.danger),
+                        tts::Status::Idle => ("朗读", palette.muted),
+                    };
+                    if action(ui, label, color) {
+                        actions.toggle_speech = Some(tts::Part::Translation);
                     }
                 }
                 let (label, color) = if self.pinned {
@@ -560,10 +622,13 @@ impl ResultPopup {
                     self.pinned = !self.pinned;
                 }
                 if action(ui, "主窗口", palette.muted) {
-                    *open_main_window = true;
+                    actions.open_main_window = true;
                 }
             });
         });
+        if let Some(error) = speech.error() {
+            ui.add(egui::Label::new(RichText::new(error).small().color(palette.danger)).wrap());
+        }
         ui.add_space(4.0);
 
         self.prepare_texture(ui.ctx(), layout.as_ref().filter(|_| !pending), image_size);
@@ -586,14 +651,19 @@ impl ResultPopup {
                     });
             }
             ui.add_space(2.0);
-            let label = if self.show_source {
-                "显示译文"
-            } else {
-                "对比原图"
-            };
-            if action(ui, label, palette.accent) {
-                self.show_source = !self.show_source;
-            }
+            ui.horizontal(|ui| {
+                let label = if self.show_source {
+                    "显示译文"
+                } else {
+                    "对比原图"
+                };
+                if action(ui, label, palette.accent) {
+                    self.show_source = !self.show_source;
+                }
+                if !source.is_empty() {
+                    speak_source(ui, actions);
+                }
+            });
             return;
         }
 
@@ -648,14 +718,17 @@ impl ResultPopup {
 
         if !source.is_empty() {
             ui.add_space(2.0);
-            let label = if self.show_source {
-                "收起原文"
-            } else {
-                "查看原文"
-            };
-            if action(ui, label, palette.accent) {
-                self.show_source = !self.show_source;
-            }
+            ui.horizontal(|ui| {
+                let label = if self.show_source {
+                    "收起原文"
+                } else {
+                    "查看原文"
+                };
+                if action(ui, label, palette.accent) {
+                    self.show_source = !self.show_source;
+                }
+                speak_source(ui, actions);
+            });
         }
 
         // The bottom-right grip resizes the window; auto-fitted windows grow with
@@ -746,7 +819,11 @@ struct OcrTranslateApp {
     settings_open: bool,
     show_api_key: bool,
     show_volcengine_keys: bool,
+    show_azure_key: bool,
     ocr_languages: Vec<String>,
+    /// Languages of the installed Windows voices, listed once the speech settings are shown.
+    speech_languages: Option<Vec<String>>,
+    speaker: tts::Speaker,
 }
 
 impl OcrTranslateApp {
@@ -799,7 +876,10 @@ impl OcrTranslateApp {
             settings_open: !config_existed,
             show_api_key: false,
             show_volcengine_keys: false,
+            show_azure_key: false,
             ocr_languages,
+            speech_languages: None,
+            speaker: tts::Speaker::default(),
         };
         if undecryptable_secrets {
             app.status =
@@ -1057,7 +1137,19 @@ impl OcrTranslateApp {
         let busy = self.busy();
         self.result
             .release_unused_image(!self.popups.is_empty(), busy);
-        if self.lightweight && !busy && self.popups.is_empty() && !self.suspending {
+        let popups = &self.popups;
+        self.speaker.retain(|window| {
+            window == tts::MAIN
+                || window == tts::SAMPLE
+                || popups.iter().any(|popup| popup.id == window)
+        });
+        // Reading aloud keeps the interface alive; it suspends once the speech has ended.
+        if self.lightweight
+            && !busy
+            && self.popups.is_empty()
+            && !self.speaker.active()
+            && !self.suspending
+        {
             let session = ipc::Session {
                 config: Some(self.config.clone()),
                 result: self.result.clone(),
@@ -1076,6 +1168,41 @@ impl OcrTranslateApp {
         if self.suspending {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+    }
+
+    /// Reads aloud the part of a result the button `key` belongs to, `source` or its
+    /// `translation`, or stops it when that button is already speaking.
+    fn toggle_speech(
+        &mut self,
+        key: tts::Key,
+        source: &str,
+        translation: &str,
+        ctx: &egui::Context,
+    ) {
+        let (text, voice) = match key.1 {
+            tts::Part::Source => (source, tts::source_voice(&self.config.ocr_language, source)),
+            tts::Part::Translation => {
+                // The source tells which way it was translated; Google's translation codes
+                // double as the voice table's language keys.
+                let target =
+                    target_for(&self.config, source).unwrap_or(&self.config.target_language);
+                let code = free_translate::target_code(target, TranslationMode::Google).ok();
+                (translation, tts::voice_for(code, translation))
+            }
+        };
+        let request = tts::Request {
+            engine: self.config.tts_engine,
+            voice,
+            text: text.trim().to_owned(),
+            rate: self
+                .config
+                .tts_rate
+                .clamp(*tts::RATE_RANGE.start(), *tts::RATE_RANGE.end()),
+            azure_key: self.config.azure_speech_key.clone(),
+            azure_region: self.config.azure_speech_region.clone(),
+        };
+        let ctx = ctx.clone();
+        self.speaker.toggle(key, request, move || tray::wake(&ctx));
     }
 
     fn shortcut_label(&self) -> String {
@@ -1303,6 +1430,8 @@ impl OcrTranslateApp {
                 ui.add_space(14.0);
                 self.draw_channel_card(ui, &palette);
                 ui.add_space(14.0);
+                self.draw_speech_card(ui, &palette);
+                ui.add_space(14.0);
                 self.draw_shortcut_card(ui, &palette);
                 ui.add_space(14.0);
                 self.draw_proxy_card(ui, &palette);
@@ -1318,6 +1447,8 @@ impl OcrTranslateApp {
                         "配置保存在当前用户的应用数据目录，密钥已加密。",
                     );
                 });
+                ui.add_space(18.0);
+                draw_about_card(ui, &palette);
                 ui.add_space(12.0);
             });
         });
@@ -1489,22 +1620,135 @@ impl OcrTranslateApp {
                 ui.add_space(10.0);
             }
 
+            let free_form = self.config.mode == TranslationMode::Vision;
             field_label(ui, palette, "目标语言");
-            if self.config.mode == TranslationMode::Vision {
-                ui.add(text_field(&mut self.config.target_language).desired_width(f32::INFINITY));
-            } else {
-                egui::ComboBox::from_id_salt("target_language")
-                    .width(ui.available_width())
-                    .selected_text(&self.config.target_language)
-                    .show_ui(ui, |ui| {
-                        for language in TARGET_LANGUAGES {
-                            ui.selectable_value(
-                                &mut self.config.target_language,
-                                language.into(),
-                                language,
-                            );
-                        }
+            language_field(
+                ui,
+                "target_language",
+                &mut self.config.target_language,
+                free_form,
+            );
+            ui.add_space(10.0);
+            ui.checkbox(&mut self.config.two_way, "智能翻译方向")
+                .on_hover_text("中文原文译成英文、外文原文译成中文这类互译，不用来回切换目标语言");
+            if self.config.two_way {
+                ui.add_space(6.0);
+                field_label(ui, palette, "原文已是目标语言时译成");
+                language_field(
+                    ui,
+                    "second_language",
+                    &mut self.config.second_language,
+                    free_form,
+                );
+                hint(ui, palette, &two_way_hint(&self.config));
+            }
+        });
+    }
+
+    fn draw_speech_card(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        card(ui, palette, |ui| {
+            section_title(
+                ui,
+                palette,
+                "朗读",
+                "在悬浮窗或主窗口朗读原文和译文：译文按目标语言、原文按文字和识别语言选择语音。",
+            );
+            field_label(ui, palette, "朗读引擎");
+            egui::ComboBox::from_id_salt("tts_engine")
+                .width(ui.available_width())
+                .selected_text(self.config.tts_engine.label())
+                .show_ui(ui, |ui| {
+                    for engine in tts::Engine::ALL {
+                        ui.selectable_value(&mut self.config.tts_engine, engine, engine.label());
+                    }
+                });
+            match self.config.tts_engine {
+                tts::Engine::Windows => {
+                    let languages = self
+                        .speech_languages
+                        .get_or_insert_with(tts::installed_languages);
+                    if languages.is_empty() {
+                        hint(
+                            ui,
+                            palette,
+                            "未检测到 Windows 语音，请在 Windows 设置 → 时间和语言 → 语音 中添加。",
+                        );
+                    } else {
+                        hint(
+                            ui,
+                            palette,
+                            &format!(
+                                "离线朗读，不上传文字。已安装语音：{}。缺少的语言可在 Windows 设置 → 时间和语言 → 语音 中添加。",
+                                languages.join("、")
+                            ),
+                        );
+                    }
+                }
+                tts::Engine::Google => hint(
+                    ui,
+                    palette,
+                    "免 Key 网页接口，译文会发送到 Google；可能受限流或网络影响，不支持调节语速。",
+                ),
+                tts::Engine::Azure => {
+                    hint(
+                        ui,
+                        palette,
+                        "在 Azure 门户创建“语音服务”资源并选择免费 F0 定价层：每月 50 万字符神经语音，用完后限流，不会扣费。",
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        field_label(ui, palette, "密钥");
+                        ui.checkbox(&mut self.show_azure_key, "显示");
                     });
+                    ui.add(
+                        text_field(&mut self.config.azure_speech_key)
+                            .desired_width(f32::INFINITY)
+                            .password(!self.show_azure_key),
+                    );
+                    ui.add_space(10.0);
+                    field_label(ui, palette, "区域");
+                    ui.add(
+                        text_field(&mut self.config.azure_speech_region)
+                            .desired_width(f32::INFINITY),
+                    );
+                    hint(
+                        ui,
+                        palette,
+                        "填写资源所在区域的英文代码，例如 eastasia、eastus。",
+                    );
+                }
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                field_label(ui, palette, "语速");
+                ui.add_enabled(
+                    self.config.tts_engine != tts::Engine::Google,
+                    egui::Slider::new(&mut self.config.tts_rate, tts::RATE_RANGE)
+                        .step_by(0.05)
+                        .suffix("×"),
+                );
+            });
+            ui.add_space(10.0);
+            let sample = (tts::SAMPLE, tts::Part::Translation);
+            let label = match self.speaker.status(sample) {
+                tts::Status::Active => "停止试听",
+                _ => "试听",
+            };
+            if ui
+                .add(secondary_button(label))
+                .on_hover_text("用当前设置（无需先保存）朗读一句目标语言示例")
+                .clicked()
+            {
+                let target = free_translate::target_code(
+                    &self.config.target_language,
+                    TranslationMode::Google,
+                )
+                .ok();
+                let text = tts::sample_text(tts::voice_for(target, "")).to_owned();
+                self.toggle_speech(sample, "", &text, ui.ctx());
+            }
+            if let tts::Status::Failed(error) = self.speaker.status(sample) {
+                ui.add(egui::Label::new(RichText::new(error).small().color(palette.danger)).wrap());
             }
         });
     }
@@ -1790,32 +2034,52 @@ impl OcrTranslateApp {
             self.shortcut_label()
         );
         let mut source_focused = false;
-        let mut clear_source = false;
-        let mut copy_translation = false;
+        let mut source_action = None;
+        let mut translation_action = None;
+        let speak_label = |part| match self.speaker.status((tts::MAIN, part)) {
+            tts::Status::Active => "停止朗读",
+            _ => "朗读",
+        };
+        let speak_source = speak_label(tts::Part::Source);
+        let speak_translation = speak_label(tts::Part::Translation);
         ui.columns(2, |columns| {
-            (source_focused, clear_source) = text_card(
+            (source_focused, source_action) = text_card(
                 &mut columns[0],
                 &palette,
                 "原文",
                 &mut self.result.source_text,
                 &source_hint,
-                "清空",
+                &["清空", speak_source],
             );
-            (_, copy_translation) = text_card(
+            (_, translation_action) = text_card(
                 &mut columns[1],
                 &palette,
                 "译文",
                 &mut self.result.translated_text,
                 "翻译结果会显示在这里",
-                "复制",
+                &["复制", speak_translation],
             );
         });
-        if clear_source {
-            self.result.source_text.clear();
+        match source_action {
+            Some(0) => self.result.source_text.clear(),
+            Some(_) => {
+                let source = self.result.source_text.clone();
+                self.toggle_speech((tts::MAIN, tts::Part::Source), &source, "", ctx);
+            }
+            None => {}
         }
-        if copy_translation {
-            ctx.copy_text(self.result.translated_text.clone());
-            self.status = "译文已复制到剪贴板。".into();
+        match translation_action {
+            Some(0) => {
+                ctx.copy_text(self.result.translated_text.clone());
+                self.status = "译文已复制到剪贴板。".into();
+            }
+            Some(_) => {
+                let source = self.result.source_text.clone();
+                let translation = self.result.translated_text.clone();
+                let key = (tts::MAIN, tts::Part::Translation);
+                self.toggle_speech(key, &source, &translation, ctx);
+            }
+            None => {}
         }
         if source_focused && ((paste_keys_down || paste_released) && !self.paste_key_down) {
             self.paste_image(ctx);
@@ -1919,8 +2183,11 @@ impl OcrTranslateApp {
                 .with_position([initial.x / root_scale, initial.y / root_scale]);
         }
         let id = egui::ViewportId::from_hash_of(egui::Id::new(("result_popup", popup.id)));
-        let mut close = false;
-        let mut open_main_window = false;
+        let speech = PopupSpeech {
+            translation: self.speaker.status((popup.id, tts::Part::Translation)),
+            source: self.speaker.status((popup.id, tts::Part::Source)),
+        };
+        let mut actions = PopupActions::default();
         ctx.show_viewport_immediate(id, builder, |ctx, _| {
             let scale = ctx.pixels_per_point();
             let [left, top, right, bottom] = popup.work_area.map(|value| value as f32 / scale);
@@ -1963,12 +2230,10 @@ impl OcrTranslateApp {
                         .inner_margin(POPUP_MARGIN),
                 )
                 .show(ctx, |ui| {
-                    ui.scope(|ui| {
-                        popup.draw(ui, &palette, image_size, &mut close, &mut open_main_window)
-                    })
-                    .response
-                    .rect
-                    .height()
+                    ui.scope(|ui| popup.draw(ui, &palette, image_size, &speech, &mut actions))
+                        .response
+                        .rect
+                        .height()
                 })
                 .inner;
 
@@ -2000,17 +2265,26 @@ impl OcrTranslateApp {
                 )));
             }
             if ctx.input(|input| input.viewport().close_requested()) {
-                close = true;
+                actions.close = true;
             }
         });
-        if open_main_window {
+        if let Some(part) = actions.toggle_speech {
+            let result = &popup.result;
+            self.toggle_speech(
+                (popup.id, part),
+                &result.source_text,
+                &result.translated_text,
+                ctx,
+            );
+        }
+        if actions.open_main_window {
             self.lightweight = false;
             let _ = self.client.send(ipc::Command::Open(ipc::View::Main));
             self.settings_open = false;
             self.reveal_main_window(ctx);
-            close = true;
+            actions.close = true;
         }
-        if close {
+        if actions.close {
             popup.close_requested = true;
         }
     }
@@ -2058,6 +2332,11 @@ impl eframe::App for OcrTranslateApp {
             return;
         }
         self.poll_usage(ctx);
+        if let Some(((window, _), error)) = self.speaker.poll() {
+            if window == tts::MAIN || window == tts::SAMPLE {
+                self.status = error;
+            }
+        }
         if !self.main_visible || !tray::main_window_visible() {
             // Workers and native tray/hotkey events wake the root window when needed.
             self.show_popups(ctx);
@@ -2149,12 +2428,55 @@ fn volcengine_credentials(config: &AppConfig) -> (String, String) {
     (access_key, secret_key)
 }
 
-/// Translates each text separately, returning one translation per input in order.
+/// The language to translate `source` into. With two-way translation, text written in the
+/// target language's script goes into the second language and anything else into the target
+/// language. `None` when that cannot be told: the text has no letters, or a vision model's
+/// free-form target language is not one whose script is known here.
+fn target_for<'a>(config: &'a AppConfig, source: &str) -> Option<&'a str> {
+    if !config.two_way {
+        return Some(&config.target_language);
+    }
+    let target =
+        free_translate::target_code(&config.target_language, TranslationMode::Google).ok()?;
+    let script = language::dominant(source)?;
+    Some(if script == language::Script::of(target) {
+        &config.second_language
+    } else {
+        &config.target_language
+    })
+}
+
+/// The settings for translating `source`, its target language settled. Two-way translation
+/// stays on only while the direction is open, for a vision model to settle from the image.
+fn directed(config: &AppConfig, source: &str) -> AppConfig {
+    let mut directed = config.clone();
+    if let Some(target) = target_for(config, source) {
+        directed.target_language = target.to_owned();
+        directed.two_way = false;
+    }
+    directed
+}
+
+/// The target language as a vision model prompt puts it, leaving an open direction to the model.
+fn vision_target(config: &AppConfig) -> String {
+    if config.two_way {
+        format!(
+            "{0}（如果原文本身就是{0}，则翻译成{1}）",
+            config.target_language, config.second_language
+        )
+    } else {
+        config.target_language.clone()
+    }
+}
+
+/// Translates each text separately, returning one translation per input in order. All of them
+/// go in the one direction their combined text calls for.
 fn translate_many_cancellable(
     config: &AppConfig,
     texts: &[String],
     cancelled: &AtomicBool,
 ) -> Result<Vec<String>, String> {
+    let config = &directed(config, &texts.join("\n"));
     let check_cancelled = || {
         if cancelled.load(Ordering::Acquire) {
             Err("任务已被新的请求替换。".to_string())
@@ -2241,15 +2563,15 @@ fn translate_lines(config: &AppConfig, texts: &[String]) -> Result<Vec<String>, 
 /// Adds dictionary details for a single English word translated into Chinese. A failed lookup
 /// leaves the translation as it is.
 fn with_dictionary(config: &AppConfig, mut result: TranslationResult) -> TranslationResult {
-    if config.target_language.contains('中')
-        && dictionary::is_single_english_word(&result.source_text)
-    {
+    let target = target_for(config, &result.source_text).unwrap_or(&config.target_language);
+    if target.contains('中') && dictionary::is_single_english_word(&result.source_text) {
         result.dictionary = dictionary::lookup(&result.source_text).map(Arc::new);
     }
     result
 }
 
 fn translate_text(config: &AppConfig, source: &str) -> Result<String, String> {
+    let config = &directed(config, source);
     match config.mode {
         TranslationMode::Vision => translate_text_with_vision(config, source),
         TranslationMode::Volcengine => {
@@ -2277,7 +2599,9 @@ fn translate_image_with_progress(
     // Position hints improve placement, but vision translation also works without an OCR pack.
     let lines = windows_ocr::recognize_lines(path, &config.ocr_language).unwrap_or_default();
     let page = layout::ImageLayout::build(path, lines)?;
-    on_source(&page.source_text());
+    let source = page.source_text();
+    on_source(&source);
+    let config = &directed(config, &source);
     let references: Vec<Value> = page
         .translatable()
         .into_iter()
@@ -2309,7 +2633,7 @@ fn translate_image_with_progress(
          bbox 是原文文字区域的左上角、宽、高，按整张图片归一化为 0 到 1000（不是右下角坐标），\
          line_count 是该区域的原文行数。不要给同一文字重复返回多个块。\n\
          保留完整原文和译文的换行。数字、价格等无需翻译的内容保持不变。\n本地 OCR 参考块：{}",
-        config.target_language,
+        vision_target(config),
         serde_json::to_string(&references).map_err(|error| error.to_string())?
     );
     let response = request_chat_completion(
@@ -2325,7 +2649,8 @@ fn translate_image_with_progress(
 fn translate_text_with_vision(config: &AppConfig, source: &str) -> Result<String, String> {
     let prompt = format!(
         "将下面的原文翻译成{}。只返回严格 JSON，不要 Markdown，不要额外说明，格式为 {{\"source_text\":\"原文\",\"translated_text\":\"译文\"}}。原文如下：\n{}",
-        config.target_language, source
+        vision_target(config),
+        source
     );
     Ok(chat_completion(config, Value::String(prompt))?.translated_text)
 }
@@ -2732,6 +3057,52 @@ fn card<R>(
         })
 }
 
+fn draw_about_card(ui: &mut egui::Ui, palette: &Palette) -> egui::InnerResponse<egui::Response> {
+    card(ui, palette, |ui| {
+        section_title(ui, palette, "关于", "应用信息与官方入口。");
+        ui.horizontal_wrapped(|ui| {
+            let size = ui.style().text_styles[&egui::TextStyle::Body].size + 3.0;
+            ui.label(
+                RichText::new("OCR Translate")
+                    .size(size)
+                    .strong()
+                    .color(palette.text),
+            );
+            egui::Frame::new()
+                .fill(palette.input)
+                .corner_radius(6u8)
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("v{APP_VERSION}"))
+                            .small()
+                            .color(palette.muted),
+                    );
+                });
+        });
+        hint(ui, palette, "轻量的 Windows 截图 OCR 与翻译工具。");
+        ui.add_space(12.0);
+        field_label(ui, palette, "官方网站 · GitHub 仓库");
+        ui.add(
+            egui::Label::new(RichText::new(OFFICIAL_WEBSITE).color(palette.text))
+                .wrap()
+                .selectable(true),
+        );
+        ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            let response = ui
+                .add(secondary_button("访问官方网站"))
+                .on_hover_text("在默认浏览器中打开官方 GitHub 仓库");
+            if response.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(OFFICIAL_WEBSITE));
+            }
+            hint(ui, palette, "查看项目说明、下载版本与反馈问题。");
+            response
+        })
+        .inner
+    })
+}
+
 fn section_title(ui: &mut egui::Ui, palette: &Palette, title: &str, subtitle: &str) {
     let size = ui.style().text_styles[&egui::TextStyle::Body].size + 3.0;
     ui.label(RichText::new(title).size(size).strong().color(palette.text));
@@ -2755,6 +3126,44 @@ fn primary_button(palette: &Palette, text: &str) -> egui::Button<'static> {
 
 fn text_field(text: &mut String) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(text).margin(egui::vec2(10.0, 7.0))
+}
+
+/// A choice of the supported target languages, or any language typed in for a vision model.
+fn language_field(ui: &mut egui::Ui, id: &str, language: &mut String, free_form: bool) {
+    if free_form {
+        ui.add(text_field(language).desired_width(f32::INFINITY));
+        return;
+    }
+    egui::ComboBox::from_id_salt(id)
+        .width(ui.available_width())
+        .selected_text(language.as_str())
+        .show_ui(ui, |ui| {
+            for option in TARGET_LANGUAGES {
+                ui.selectable_value(language, option.into(), option);
+            }
+        });
+}
+
+/// Explains which way two-way translation goes with the chosen pair of languages.
+fn two_way_hint(config: &AppConfig) -> String {
+    let (target, second) = (config.target_language.trim(), config.second_language.trim());
+    let script = |name| {
+        free_translate::target_code(name, TranslationMode::Google)
+            .ok()
+            .map(language::Script::of)
+    };
+    let rule = format!("原文是{target}时译成{second}，其他语言都译成{target}。");
+    match (script(target), script(second)) {
+        (Some(main), Some(other)) if main == other => format!(
+            "{target}和{second}都使用{}，无法按文字区分：这种文字的原文都会译成{second}。",
+            main.label()
+        ),
+        (Some(language::Script::Latin), _) => {
+            format!("{rule}按文字判断，英、法、西、德等拉丁字母的原文都会当作{target}。")
+        }
+        (Some(_), _) => format!("{rule}按原文的文字判断。"),
+        (None, _) => format!("{rule}由视觉模型判断原文语言。"),
+    }
 }
 
 fn secondary_button(text: &str) -> egui::Button<'static> {
@@ -2808,16 +3217,17 @@ fn segmented<T: PartialEq + Copy>(
 }
 
 /// A titled card with a borderless editor filling the rest of the column.
-/// Returns whether the editor has focus and whether the header action was clicked.
+/// Returns whether the editor has focus and which header action, if any, was clicked;
+/// the actions are laid out right to left starting with the first.
 fn text_card(
     ui: &mut egui::Ui,
     palette: &Palette,
     title: &str,
     text: &mut String,
     hint_text: &str,
-    action: &str,
-) -> (bool, bool) {
-    let mut action_clicked = false;
+    actions: &[&str],
+) -> (bool, Option<usize>) {
+    let mut action_clicked = None;
     let focused = card(ui, palette, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(title).strong().color(palette.text));
@@ -2830,12 +3240,18 @@ fn text_card(
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                action_clicked = ui
-                    .add_enabled(
-                        !text.is_empty(),
-                        egui::Button::new(RichText::new(action).color(palette.accent)).frame(false),
-                    )
-                    .clicked();
+                for (index, action) in actions.iter().enumerate() {
+                    if ui
+                        .add_enabled(
+                            !text.is_empty(),
+                            egui::Button::new(RichText::new(*action).color(palette.accent))
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        action_clicked = Some(index);
+                    }
+                }
             });
         });
         ui.add_space(4.0);
@@ -2929,6 +3345,128 @@ fn run_ui() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_about_card(
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::Rect, egui::Rect) {
+        let mut card_rect = egui::Rect::NOTHING;
+        let mut button_rect = egui::Rect::NOTHING;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 1000.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                let theme = if ctx.style().visuals.dark_mode {
+                    ThemeMode::Night
+                } else {
+                    ThemeMode::Day
+                };
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = draw_about_card(ui, &Palette::of(theme));
+                    card_rect = response.response.rect;
+                    button_rect = response.inner.rect;
+                });
+            },
+        );
+        (output, card_rect, button_rect)
+    }
+
+    #[test]
+    fn about_card_shows_version_and_website_without_horizontal_overflow() {
+        for theme in [ThemeMode::Day, ThemeMode::Night] {
+            for width in [375.0, 680.0] {
+                for font_size in [DEFAULT_FONT_SIZE, *FONT_SIZE_RANGE.end()] {
+                    let ctx = egui::Context::default();
+                    install_system_fonts(&ctx);
+                    apply_appearance(
+                        &ctx,
+                        &AppConfig {
+                            theme,
+                            font_size,
+                            ..Default::default()
+                        },
+                    );
+                    let _ = render_about_card(&ctx, width, Vec::new());
+                    let (output, card_rect, button_rect) =
+                        render_about_card(&ctx, width, Vec::new());
+                    let rendered_text: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    for expected in [
+                        "关于",
+                        "OCR Translate",
+                        &format!("v{APP_VERSION}"),
+                        "官方网站 · GitHub 仓库",
+                        OFFICIAL_WEBSITE,
+                        "访问官方网站",
+                    ] {
+                        assert!(
+                            rendered_text.contains(&expected),
+                            "missing about text: {expected}"
+                        );
+                    }
+                    assert!(card_rect.is_finite());
+                    assert!(card_rect.left() >= 0.0 && card_rect.right() <= width + 1.0);
+                    assert!(card_rect.contains_rect(button_rect));
+                    assert!(
+                        output.platform_output.commands.is_empty(),
+                        "rendering the about card must not open the browser"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn about_website_button_opens_only_the_official_repository() {
+        let ctx = egui::Context::default();
+        apply_appearance(&ctx, &AppConfig::default());
+        let _ = render_about_card(&ctx, 680.0, Vec::new());
+        let (_, _, button_rect) = render_about_card(&ctx, 680.0, Vec::new());
+        let position = button_rect.center();
+        let (pressed, _, _) = render_about_card(
+            &ctx,
+            680.0,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        assert!(pressed.platform_output.commands.is_empty());
+        let (released, _, _) = render_about_card(
+            &ctx,
+            680.0,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(
+            released.platform_output.commands,
+            vec![egui::OutputCommand::OpenUrl(egui::OpenUrl::new_tab(
+                OFFICIAL_WEBSITE
+            ))]
+        );
+    }
 
     fn vision_page() -> layout::ImageLayout {
         layout::ImageLayout {
@@ -3214,6 +3752,68 @@ mod tests {
         assert_eq!(config.theme, ThemeMode::Night);
         assert_eq!(config.font_size, DEFAULT_FONT_SIZE);
         assert_eq!(config.close_behavior, CloseBehavior::Tray);
+        assert!(config.two_way);
+        assert_eq!(config.second_language, "英语");
+    }
+
+    #[test]
+    fn two_way_translation_turns_text_in_the_target_language_around() {
+        let config = AppConfig::default();
+        assert_eq!(target_for(&config, "Hello world"), Some("简体中文"));
+        assert_eq!(target_for(&config, "こんにちは、世界"), Some("简体中文"));
+        assert_eq!(target_for(&config, "你好，世界"), Some("英语"));
+        assert_eq!(target_for(&config, "12:30"), None);
+        let japanese = AppConfig {
+            target_language: "日语".into(),
+            second_language: "简体中文".into(),
+            ..Default::default()
+        };
+        assert_eq!(target_for(&japanese, "你好，世界"), Some("日语"));
+        assert_eq!(target_for(&japanese, "こんにちは、世界"), Some("简体中文"));
+        let one_way = AppConfig {
+            two_way: false,
+            ..Default::default()
+        };
+        assert_eq!(target_for(&one_way, "你好，世界"), Some("简体中文"));
+    }
+
+    #[test]
+    fn directed_settings_settle_the_target_or_leave_it_to_a_vision_model() {
+        let config = AppConfig::default();
+        let settled = directed(&config, "你好");
+        assert_eq!(settled.target_language, "英语");
+        assert!(!settled.two_way);
+        assert_eq!(vision_target(&settled), "英语");
+        // Without recognized text the vision model gets both languages and the rule.
+        let open = directed(&config, "");
+        assert!(open.two_way);
+        assert_eq!(
+            vision_target(&open),
+            "简体中文（如果原文本身就是简体中文，则翻译成英语）"
+        );
+        // A free-form target of unknown script leaves the direction to the model as well.
+        let custom = AppConfig {
+            target_language: "意大利语".into(),
+            ..Default::default()
+        };
+        assert!(directed(&custom, "Ciao a tutti").two_way);
+    }
+
+    #[test]
+    #[ignore = "uses the live Tencent and Google translation endpoints"]
+    fn translates_live_text_both_ways() {
+        for mode in [TranslationMode::Tencent, TranslationMode::Google] {
+            let config = AppConfig {
+                mode,
+                ..Default::default()
+            };
+            let english = translate_text(&config, "你好，世界").unwrap();
+            assert!(english.to_lowercase().contains("world"), "{english}");
+            let chinese = translate_text(&config, "Good morning, world").unwrap();
+            assert!(chinese.contains('世'), "{chinese}");
+            let from_japanese = translate_text(&config, "おはようございます、世界").unwrap();
+            assert!(from_japanese.contains('世'), "{from_japanese}");
+        }
     }
 
     #[test]
