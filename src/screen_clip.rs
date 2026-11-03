@@ -43,6 +43,10 @@ const HOTKEY_ID: i32 = 1;
 const WM_SET_HOTKEY: u32 = WM_APP + 1;
 pub const CANCELLED: &str = "已取消框选截图。";
 const STALE_CAPTURE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often a running snip checks the clipboard for its screenshot.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(15);
+/// How often a running snip checks whether the selection overlay is still open.
+const OVERLAY_CHECK: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hotkey {
@@ -424,6 +428,7 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
     let mut escape_was_down = escape_down();
     let mut overlay_seen = false;
     let mut overlay_left_at: Option<Instant> = None;
+    let mut overlay_checked: Option<Instant> = None;
     while started.elapsed() < Duration::from_secs(60) {
         let escape_is_down = escape_down();
         if escape_is_down && !escape_was_down {
@@ -431,24 +436,30 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
         }
         escape_was_down = escape_is_down;
 
-        // Some Windows builds show a non-activating selector, leaving another app foreground.
-        if snipping_tool_visible() {
-            overlay_seen = true;
-            overlay_left_at = None;
-        } else if overlay_seen {
-            let left_at = *overlay_left_at.get_or_insert_with(Instant::now);
-            if left_at.elapsed() > Duration::from_millis(1500) {
-                return Err(CANCELLED.into());
+        // Looking for the overlay walks every window, so it runs a few times a second while
+        // the cheap clipboard counter is polled often enough not to delay the result.
+        if overlay_checked.is_none_or(|checked| checked.elapsed() >= OVERLAY_CHECK) {
+            overlay_checked = Some(Instant::now());
+            // Some Windows builds show a non-activating selector, leaving another app foreground.
+            if snipping_tool_visible() {
+                overlay_seen = true;
+                overlay_left_at = None;
+            } else if overlay_seen {
+                let left_at = *overlay_left_at.get_or_insert_with(Instant::now);
+                if left_at.elapsed() > Duration::from_millis(1500) {
+                    return Err(CANCELLED.into());
+                }
+            } else if started.elapsed() > Duration::from_secs(10) {
+                return Err("Windows 截图框未能打开，请检查系统截图工具后重试。".into());
             }
-        } else if started.elapsed() > Duration::from_secs(10) {
-            return Err("Windows 截图框未能打开，请检查系统截图工具后重试。".into());
         }
 
         let current = unsafe { GetClipboardSequenceNumber() };
         if current != sequence {
             sequence = current;
-            // The screenshot app can briefly hold the clipboard open after writing it.
-            for _ in 0..10 {
+            // The screenshot app can briefly hold the clipboard open after writing it;
+            // retry quickly, for up to half a second.
+            for _ in 0..25 {
                 let image =
                     arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
                 if let Ok(data) = image {
@@ -458,10 +469,10 @@ fn capture_region_inner(hotkey: Option<Hotkey>) -> Result<PathBuf, String> {
                     }
                     return saved;
                 }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(20));
             }
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(CLIPBOARD_POLL);
     }
     Err("等待框选截图超时。若已取消，请重试快捷键。".into())
 }

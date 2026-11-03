@@ -37,6 +37,8 @@ pub enum Part {
 /// Identifies one read-aloud button: the window it sits in and the text it reads.
 pub type Key = (u64, Part);
 pub const RATE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+/// For one online speech request.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -409,18 +411,9 @@ fn memory_stream(bytes: &[u8]) -> Result<IRandomAccessStream, String> {
     write().map_err(|error| format!("准备朗读音频失败：{error}"))
 }
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
-    crate::net::client_builder()?
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
-        .build()
-        .map_err(|error| format!("创建网络客户端失败：{error}"))
-}
-
 /// Google reads at most about 200 characters per request; the MP3 pieces simply concatenate.
 fn google_audio(request: &Request, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
-    let client = http_client()?;
+    let client = crate::net::client()?;
     let mut audio = Vec::new();
     for piece in chunks(&request.text, 180) {
         if cancel.load(Ordering::Acquire) {
@@ -428,6 +421,8 @@ fn google_audio(request: &Request, cancel: &AtomicBool) -> Result<Vec<u8>, Strin
         }
         let response = client
             .get("https://translate.googleapis.com/translate_tts")
+            .timeout(TIMEOUT)
+            .header(reqwest::header::USER_AGENT, crate::net::BROWSER_AGENT)
             .query(&[
                 ("ie", "UTF-8"),
                 ("client", "gtx"),
@@ -461,7 +456,7 @@ fn azure_audio(request: &Request, cancel: &AtomicBool) -> Result<Vec<u8>, String
         return Err("Azure 区域无效，请填写语音资源所在区域，例如 eastasia。".into());
     }
     let url = format!("https://{region}.tts.speech.microsoft.com/cognitiveservices/v1");
-    let client = http_client()?;
+    let client = crate::net::client()?;
     let mut audio = Vec::new();
     for piece in chunks(&request.text, 1000) {
         if cancel.load(Ordering::Acquire) {
@@ -469,6 +464,9 @@ fn azure_audio(request: &Request, cancel: &AtomicBool) -> Result<Vec<u8>, String
         }
         let response = client
             .post(&url)
+            .timeout(TIMEOUT)
+            // Azure rejects speech requests without a user agent.
+            .header(reqwest::header::USER_AGENT, "ocr-translate")
             .header("Ocp-Apim-Subscription-Key", key)
             .header("Content-Type", "application/ssml+xml")
             .header(

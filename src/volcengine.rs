@@ -14,8 +14,9 @@ struct Endpoint {
     query: &'static str,
 }
 
+pub const TRANSLATE_HOST: &str = "translate.volcengineapi.com";
 const TRANSLATE: Endpoint = Endpoint {
-    host: "translate.volcengineapi.com",
+    host: TRANSLATE_HOST,
     service: "translate",
     query: "Action=TranslateText&Version=2025-03-01",
 };
@@ -99,13 +100,9 @@ fn post(
     let body = serde_json::to_string(body).map_err(|error| format!("创建火山请求失败：{error}"))?;
     let date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let (body_hash, authorization) = sign(endpoint, access_key, secret_key, &date, &body);
-    let client = crate::net::client_builder()?
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|error| format!("创建网络客户端失败：{error}"))?;
-    let response = client
+    let response = crate::net::client()?
         .post(format!("https://{}/?{}", endpoint.host, endpoint.query))
+        .timeout(Duration::from_secs(60))
         .header("Host", endpoint.host)
         .header("Content-Type", "application/json")
         .header("X-Date", date)

@@ -9,10 +9,12 @@ use std::{
         Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     System::Threading::GetCurrentThreadId,
+    UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
     UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW, TranslateMessage, MSG,
         PM_NOREMOVE, WM_APP,
@@ -49,6 +51,21 @@ struct Ui {
 struct Task {
     id: u64,
     cancelled: Arc<AtomicBool>,
+}
+
+impl Ui {
+    /// Whether the process ended by itself with a failure, such as a crash, rather than by
+    /// exiting normally. Waits briefly, as the pipe closes just before the process is gone.
+    fn crashed(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match self.process.try_wait() {
+                Ok(Some(status)) => return !status.success(),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                _ => return false,
+            }
+        }
+    }
 }
 
 impl Drop for Ui {
@@ -306,6 +323,7 @@ impl Background {
         if self.capture_in_progress {
             return;
         }
+        crate::warm_up_translation(&self.config);
         self.capture_in_progress = true;
         self.update_busy();
         let sender = self.sender.clone();
@@ -439,6 +457,7 @@ impl Background {
         while let Ok(event) = self.hotkey.events.try_recv() {
             match event {
                 HotkeyEvent::Started => {
+                    crate::warm_up_translation(&self.config);
                     self.capture_in_progress = true;
                     self.update_busy();
                     self.send(Event::Hotkey(HotkeyEvent::Started));
@@ -476,13 +495,18 @@ impl Background {
                         .as_ref()
                         .is_some_and(|ui| ui.generation == generation)
                     {
-                        let ui = self.ui.take().unwrap();
+                        let mut ui = self.ui.take().unwrap();
                         let closing = ui.closing;
+                        let crashed = !closing && ui.crashed();
                         // Pipe EOF or a malformed frame does not guarantee process exit.
                         // Drop kills and reaps only our own child before restoring control.
                         drop(ui);
                         if let Some(view) = self.pending_view.take() {
                             self.report_show(view);
+                        } else if crashed && self.tray.is_some() {
+                            // A crashed interface must not take the tray and the shortcut down
+                            // with it; the next capture or tray action starts a new one.
+                            self.session.status = "界面意外退出，已自动恢复。".into();
                         } else if self.ui_disconnect_requires_exit(closing) {
                             self.quitting = true;
                         }
@@ -536,6 +560,7 @@ impl Background {
         if self.capture_in_progress {
             return;
         }
+        crate::warm_up_translation(&self.config);
         self.capture_in_progress = true;
         self.update_busy();
         let sender = self.sender.clone();
@@ -549,6 +574,9 @@ impl Background {
 }
 
 pub fn run() -> Result<(), String> {
+    // Physical pixels for the cursor position a popup is anchored at, as in the UI process,
+    // which winit makes per-monitor DPI aware. Otherwise scaled displays shift every popup.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let Some(mut instance) =
         single_instance::SingleInstance::acquire().map_err(|e| e.to_string())?
     else {
@@ -618,7 +646,6 @@ pub fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     fn fixture() -> Background {
         let (sender, receiver) = mpsc::channel();
@@ -675,6 +702,33 @@ mod tests {
         assert!(app.ui_disconnect_requires_exit(false));
         app.lightweight = true;
         assert!(app.ui_disconnect_requires_exit(false));
+    }
+
+    #[test]
+    fn only_a_failed_exit_counts_as_a_crash() {
+        for (code, crashed) in [("0", false), ("3", true)] {
+            let mut process = ProcessCommand::new("cmd")
+                .args(["/C", "exit", code])
+                .creation_flags(0x08000000)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while process.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "cmd did not exit");
+                thread::sleep(Duration::from_millis(10));
+            }
+            let (events, _outgoing) = mpsc::channel();
+            let mut ui = Ui {
+                process,
+                events,
+                generation: 1,
+                closing: false,
+            };
+            assert_eq!(ui.crashed(), crashed, "exit code {code}");
+        }
     }
 
     #[test]

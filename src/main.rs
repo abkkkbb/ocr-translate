@@ -227,6 +227,8 @@ struct ResultPopup {
     copied: bool,
     /// Physical rectangle last requested for the window, to tell clicks inside from outside.
     placed: Option<egui::Rect>,
+    /// The window starts hidden and appears once it has the geometry it was drawn for.
+    shown: bool,
     width: f32,
     height: f32,
     /// Physical cursor and window geometry captured at the start of a drag.
@@ -369,6 +371,7 @@ impl ResultPopup {
             show_source: false,
             copied: false,
             placed: None,
+            shown: false,
             width: POPUP_WIDTH,
             height: 120.0,
             drag_origin: None,
@@ -400,6 +403,17 @@ impl ResultPopup {
         if corner.y + size.y > bottom {
             corner.y = y - GAP - size.y;
         }
+        egui::pos2(
+            corner.x.clamp(left, (right - size.x).max(left)),
+            corner.y.clamp(top, (bottom - size.y).max(top)),
+        )
+    }
+
+    /// Where a window already on screen goes when its size changes: it keeps its corner,
+    /// moved only as far as the work area requires, rather than jumping to the other side
+    /// of the selection as a fresh placement might.
+    fn settle(&self, corner: egui::Pos2, size: egui::Vec2) -> egui::Pos2 {
+        let [left, top, right, bottom] = self.work_area.map(|value| value as f32);
         egui::pos2(
             corner.x.clamp(left, (right - size.x).max(left)),
             corner.y.clamp(top, (bottom - size.y).max(top)),
@@ -533,11 +547,13 @@ impl ResultPopup {
     }
 
     /// Draw one popup's content: header controls, translation, and the resize grip.
+    /// `target` names the language the translation went into, when that can vary.
     fn draw(
         &mut self,
         ui: &mut egui::Ui,
         palette: &Palette,
         image_size: Option<egui::Vec2>,
+        target: Option<&str>,
         speech: &PopupSpeech,
         actions: &mut PopupActions,
     ) {
@@ -593,6 +609,13 @@ impl ResultPopup {
                 }
             } else {
                 ui.label(RichText::new("译文").small().strong().color(palette.muted));
+            }
+            if let Some(target) = target.filter(|_| !pending && !translated.is_empty()) {
+                ui.label(
+                    RichText::new(format!("译成{target}"))
+                        .small()
+                        .color(palette.muted),
+                );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if action(ui, "关闭", palette.muted) {
@@ -2108,7 +2131,10 @@ impl OcrTranslateApp {
             self.show_one_popup(ctx, &mut popups[index], click_inside_any, &occupied);
         }
         popups.retain(|popup| !popup.close_requested);
-        if popups.iter().any(|popup| !popup.pinned) {
+        if popups.iter().any(|popup| !popup.shown) {
+            // A hidden popup appears on the next frame; do not wait for the polling interval.
+            ctx.request_repaint();
+        } else if popups.iter().any(|popup| !popup.pinned) {
             // Unpinned popups poll for dismissal; pinned ones repaint on input events.
             ctx.request_repaint_after(Duration::from_millis(30));
         }
@@ -2178,7 +2204,10 @@ impl OcrTranslateApp {
             .with_taskbar(false)
             .with_active(false);
         if first_placement {
+            // Windows shows a new window at its default size and place before it takes the
+            // requested ones, so the popup starts hidden instead of flashing there.
             builder = builder
+                .with_visible(false)
                 .with_inner_size([width, popup.height])
                 .with_position([initial.x / root_scale, initial.y / root_scale]);
         }
@@ -2187,6 +2216,14 @@ impl OcrTranslateApp {
             translation: self.speaker.status((popup.id, tts::Part::Translation)),
             source: self.speaker.status((popup.id, tts::Part::Source)),
         };
+        // With two-way translation the direction depends on the text, so say which it took.
+        let target = self
+            .config
+            .two_way
+            .then(|| target_for(&self.config, &popup.result.source_text))
+            .flatten()
+            .map(str::to_owned);
+        let target = target.as_deref();
         let mut actions = PopupActions::default();
         ctx.show_viewport_immediate(id, builder, |ctx, _| {
             let scale = ctx.pixels_per_point();
@@ -2230,10 +2267,12 @@ impl OcrTranslateApp {
                         .inner_margin(POPUP_MARGIN),
                 )
                 .show(ctx, |ui| {
-                    ui.scope(|ui| popup.draw(ui, &palette, image_size, &speech, &mut actions))
-                        .response
-                        .rect
-                        .height()
+                    ui.scope(|ui| {
+                        popup.draw(ui, &palette, image_size, target, &speech, &mut actions)
+                    })
+                    .response
+                    .rect
+                    .height()
                 })
                 .inner;
 
@@ -2246,15 +2285,14 @@ impl OcrTranslateApp {
             } else {
                 egui::vec2(width, height) * scale
             };
-            let corner = if popup.moved {
-                popup
-                    .placed
-                    .map_or(popup.place_avoiding(size, occupied), |rect| rect.min)
-            } else {
-                popup.place_avoiding(size, occupied)
+            let first_frame = popup.placed.is_none();
+            let corner = match popup.placed {
+                Some(rect) if popup.moved || popup.shown => popup.settle(rect.min, size),
+                _ => popup.place_avoiding(size, occupied),
             };
             let rect = egui::Rect::from_min_size(corner, size);
-            if popup.placed != Some(rect) {
+            let settled = popup.placed == Some(rect);
+            if !settled {
                 popup.placed = Some(rect);
                 popup.width = size.x / scale;
                 popup.height = size.y / scale;
@@ -2263,6 +2301,12 @@ impl OcrTranslateApp {
                     corner.x / scale,
                     corner.y / scale,
                 )));
+            }
+            // The hidden window took its size and place after the first frame; from the
+            // second on it is shown, and later content changes grow it where it stands.
+            if !popup.shown && !first_frame {
+                popup.shown = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             }
             if ctx.input(|input| input.viewport().close_requested()) {
                 actions.close = true;
@@ -2469,6 +2513,19 @@ fn vision_target(config: &AppConfig) -> String {
     }
 }
 
+/// Connects to the server a capture will be translated by while the user is still selecting.
+fn warm_up_translation(config: &AppConfig) {
+    let url = match config.mode {
+        TranslationMode::Tencent => free_translate::TENCENT_URL.to_owned(),
+        TranslationMode::Google => free_translate::GOOGLE_URL.to_owned(),
+        TranslationMode::Volcengine => format!("https://{}/", volcengine::TRANSLATE_HOST),
+        TranslationMode::Vision => config.api_url.trim().to_owned(),
+    };
+    if url.starts_with("https://") || url.starts_with("http://") {
+        net::warm_up(url);
+    }
+}
+
 /// Translates each text separately, returning one translation per input in order. All of them
 /// go in the one direction their combined text calls for.
 fn translate_many_cancellable(
@@ -2669,13 +2726,9 @@ fn request_chat_completion(config: &AppConfig, content: Value) -> Result<String,
             "content": content
         }]
     });
-    let client = net::client_builder()?
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|error| format!("创建网络客户端失败：{error}"))?;
-    let response = client
+    let response = net::client()?
         .post(&config.api_url)
+        .timeout(Duration::from_secs(120))
         .bearer_auth(&config.api_key)
         .json(&body)
         .send()
@@ -3905,6 +3958,7 @@ mod tests {
             show_source: false,
             copied: false,
             placed: None,
+            shown: false,
             width: POPUP_WIDTH,
             height: 120.0,
             drag_origin: None,
@@ -3936,6 +3990,22 @@ mod tests {
     fn popup_opens_below_right_of_the_selection_end() {
         let corner = popup_at([500, 300]).place(egui::vec2(400.0, 200.0));
         assert_eq!(corner, egui::pos2(516.0, 316.0));
+    }
+
+    #[test]
+    fn a_shown_popup_keeps_its_corner_and_only_moves_to_stay_on_screen() {
+        let popup = popup_at([500, 900]);
+        let corner = egui::pos2(516.0, 700.0);
+        assert_eq!(popup.settle(corner, egui::vec2(400.0, 200.0)), corner);
+        // Growing past the bottom moves it up by the overflow, not above the anchor.
+        assert_eq!(
+            popup.settle(corner, egui::vec2(400.0, 500.0)),
+            egui::pos2(516.0, 540.0)
+        );
+        assert_eq!(
+            popup.settle(egui::pos2(1700.0, 100.0), egui::vec2(400.0, 200.0)),
+            egui::pos2(1520.0, 100.0)
+        );
     }
 
     #[test]

@@ -38,23 +38,21 @@ pub fn is_single_english_word(text: &str) -> bool {
 /// Returns `None` when neither source knows the word, e.g. a misspelling.
 pub fn lookup(word: &str) -> Option<Entry> {
     let word = word.trim();
-    let client = crate::net::client_builder()
-        .ok()?
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
-        .build()
-        .ok()?;
-    let youdao = client
-        .get("https://dict.youdao.com/jsonapi")
+    let client = crate::net::client().ok()?;
+    let get = |url: &str| {
+        client
+            .get(url)
+            .timeout(Duration::from_secs(15))
+            .header(reqwest::header::USER_AGENT, crate::net::BROWSER_AGENT)
+    };
+    let youdao = get("https://dict.youdao.com/jsonapi")
         .query(&[("q", word), ("le", "en")])
         .send()
         .and_then(|response| response.text())
         .ok()
         .and_then(|body| parse_youdao(word, &body));
     youdao.or_else(|| {
-        client
-            .get("https://translate.googleapis.com/translate_a/single")
+        get("https://translate.googleapis.com/translate_a/single")
             .query(&[
                 ("client", "gtx"),
                 ("sl", "en"),

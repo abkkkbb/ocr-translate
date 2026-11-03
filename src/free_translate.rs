@@ -1,16 +1,15 @@
-use crate::TranslationMode;
+use crate::{net::BROWSER_AGENT, TranslationMode};
+use reqwest::header::USER_AGENT;
 use serde_json::Value;
 use std::time::Duration;
 
+pub const TENCENT_URL: &str = "https://transmart.qq.com/api/imt";
+pub const GOOGLE_URL: &str = "https://translate.googleapis.com/translate_a/single";
+const TIMEOUT: Duration = Duration::from_secs(60);
+
 pub fn translate(text: &str, target: &str, mode: TranslationMode) -> Result<String, String> {
     let language = target_code(target, mode)?;
-    let client = crate::net::client_builder()?
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(60))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
-        .build()
-        .map_err(|error| format!("创建网络客户端失败：{error}"))?;
-
+    let client = crate::net::client()?;
     match mode {
         TranslationMode::Tencent => translate_tencent(&client, text, language),
         TranslationMode::Google => translate_google(&client, text, language),
@@ -55,7 +54,9 @@ fn translate_tencent(
         "target": { "lang": target }
     });
     let response = client
-        .post("https://transmart.qq.com/api/imt")
+        .post(TENCENT_URL)
+        .timeout(TIMEOUT)
+        .header(USER_AGENT, BROWSER_AGENT)
         .header("Referer", "https://yi.qq.com/zh-CN/index")
         .json(&body)
         .send()
@@ -89,7 +90,9 @@ fn translate_google(
     target: &str,
 ) -> Result<String, String> {
     let response = client
-        .get("https://translate.googleapis.com/translate_a/single")
+        .get(GOOGLE_URL)
+        .timeout(TIMEOUT)
+        .header(USER_AGENT, BROWSER_AGENT)
         .query(&[
             ("client", "gtx"),
             ("dt", "t"),
